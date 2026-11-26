@@ -33,3 +33,5 @@ The experimental engine uses the published Servo 0.7.0 Cargo package. We do not 
 See [security boundaries](docs/security.md) and [resource measurement](docs/performance.md) for what the current implementation does and does not provide.
 
 Lutra is an independent project. It is not affiliated with Mullvad, the Tor Project or Servo.
+
+If the native browser closes on startup, run `start-lutra-diagnostic.bat` in the extracted CI package. Review the local log before sharing it. The startup check in CI does not verify web-page rendering.

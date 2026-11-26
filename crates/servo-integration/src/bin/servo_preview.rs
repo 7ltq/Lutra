@@ -103,6 +103,7 @@ struct Engine {
     viewport: egui::Rect,
     viewport_scale: f32,
     next_animation: Instant,
+    first_frame: bool,
 }
 
 fn session_options(session: &SessionDirectory) -> Opts {
@@ -138,33 +139,40 @@ fn window_icon() -> Option<Icon> {
 
 impl Engine {
     fn start(event_loop: &ActiveEventLoop, waker: Waker, initial: Option<Url>, session: &SessionDirectory) -> Result<Self, Box<dyn Error>> {
-        let display = event_loop.display_handle()?;
-        let window = Rc::new(event_loop.create_window(
-            Window::default_attributes()
-                .with_title("Lutra — experimental browser")
-                .with_window_icon(window_icon())
-                .with_inner_size(LogicalSize::new(1180.0, 760.0))
-                .with_min_inner_size(LogicalSize::new(640.0, 420.0)),
-        )?);
-        let handle = window.window_handle()?;
-        let parent = Rc::new(
-            WindowRenderingContext::new(display, handle, window.inner_size())
-                .map_err(|error| format!("Rendering context: {error:?}"))?,
-        );
-        parent.make_current().map_err(|error| format!("Graphics context: {error:?}"))?;
-        let context = Rc::new(parent.offscreen_context(window.inner_size()));
-        context.make_current().map_err(|error| format!("Offscreen context: {error:?}"))?;
-        let gui = EguiGlow::new(event_loop, context.glow_gl_api(), None, None, false);
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(16, 28, 54);
-        visuals.selection.bg_fill = egui::Color32::from_rgb(54, 79, 120);
-        gui.egui_ctx.set_visuals(visuals);
+        eprintln!("[Lutra] Initializing Servo");
         let servo = ServoBuilder::default()
             .opts(session_options(session))
             .preferences(restricted_preferences())
             .event_loop_waker(Box::new(waker))
             .build();
         servo.setup_logging();
+        eprintln!("[Lutra] Servo initialized; creating window");
+        let display = event_loop.display_handle()?;
+        let window = Rc::new(event_loop.create_window(
+            Window::default_attributes()
+                .with_title("Lutra — experimental browser")
+                .with_visible(false)
+                .with_window_icon(window_icon())
+                .with_inner_size(LogicalSize::new(1180.0, 760.0))
+                .with_min_inner_size(LogicalSize::new(640.0, 420.0)),
+        )?);
+        let handle = window.window_handle()?;
+        eprintln!("[Lutra] Creating graphics context");
+        let parent = Rc::new(
+            WindowRenderingContext::new(display, handle, window.inner_size())
+                .map_err(|error| format!("Rendering context: {error:?}"))?,
+        );
+        parent.make_current().map_err(|error| format!("Graphics context: {error:?}"))?;
+        eprintln!("[Lutra] Creating offscreen framebuffer");
+        let context = Rc::new(parent.offscreen_context(window.inner_size()));
+        context.make_current().map_err(|error| format!("Offscreen context: {error:?}"))?;
+        eprintln!("[Lutra] Initializing interface painter");
+        let gui = EguiGlow::new(event_loop, context.glow_gl_api(), None, None, false);
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = egui::Color32::from_rgb(16, 28, 54);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(54, 79, 120);
+        gui.egui_ctx.set_visuals(visuals);
+
         let delegate = Rc::new(Delegate(window.clone()));
         let mut engine = Self {
             tabs: NativeTabs::default(),
@@ -185,10 +193,13 @@ impl Engine {
             viewport: egui::Rect::NOTHING,
             viewport_scale: 1.0,
             next_animation: Instant::now(),
+            first_frame: false,
         };
         if let Some(url) = initial {
             engine.apply(Action::Navigate(url));
         }
+        engine.window.set_visible(true);
+        eprintln!("[Lutra] Window initialized");
         engine.window.request_redraw();
         Ok(engine)
     }
@@ -421,6 +432,10 @@ impl Engine {
             parent.prepare_for_rendering();
             gui.paint(window);
             parent.present();
+            if !self.first_frame {
+                self.first_frame = true;
+                eprintln!("[Lutra] First interface frame submitted");
+            }
         }
         if gui.egui_ctx.has_requested_repaint() {
             window.request_redraw();
@@ -438,7 +453,9 @@ impl Engine {
         match event {
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::Resized(size) if size.width != 0 && size.height != 0 => {
-                self.parent.resize(size);
+                if self.parent.size() != size {
+                    self.parent.resize(size);
+                }
                 self.cursor = None;
                 self.window.request_redraw();
             }
@@ -592,6 +609,8 @@ struct App {
     initial: Option<(Waker, Option<Url>)>,
     engine: Option<Engine>,
     error: Option<String>,
+    smoke: bool,
+    smoke_exit_at: Option<Instant>,
 }
 
 impl ApplicationHandler<Wake> for App {
@@ -615,6 +634,21 @@ impl ApplicationHandler<Wake> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(engine) = &mut self.engine else { return };
+        if self.smoke {
+            if engine.first_frame {
+                let deadline = *self.smoke_exit_at.get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
+                if Instant::now() >= deadline {
+                    eprintln!("[Lutra] Startup smoke check passed");
+                    event_loop.exit();
+                    return;
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(100)));
+                engine.window.request_redraw();
+            }
+            return;
+        }
         if !engine.tabs.active().is_some_and(WebView::animating) || engine.window.is_minimized() == Some(true) {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
@@ -672,7 +706,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     if argument.as_deref() == Some("--check-config") {
         return check_config();
     }
-    let initial = argument.map(|input| Url::parse(&input)).transpose()?;
+    let smoke = argument.as_deref() == Some("--smoke-startup");
+    let initial = if smoke { None } else { argument.map(|input| Url::parse(&input)).transpose()? };
     if initial.as_ref().is_some_and(|url| !servo_integration::ServoAdapter::accepts(url)) {
         return Err("Only HTTPS websites without credentials are supported".into());
     }
@@ -683,8 +718,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         initial: Some((Waker(event_loop.create_proxy()), initial)),
         engine: None,
         error: None,
+        smoke,
+        smoke_exit_at: None,
     };
     let run_result = event_loop.run_app(&mut app);
+    let smoke_ok = !smoke || app.smoke_exit_at.is_some_and(|deadline| Instant::now() >= deadline);
     drop(app.engine.take());
     let cleanup_result = app.session.close();
     run_result?;
@@ -692,5 +730,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(error.into());
     }
     cleanup_result?;
+    if !smoke_ok { return Err("Startup smoke check ended before first frame".into()); }
     Ok(())
 }

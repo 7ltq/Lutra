@@ -7,3 +7,7 @@ The CI workflow uses Windows Server 2022 with Visual Studio 2022, a short target
 Artifacts are uploaded only after compilation and the configuration check succeed. The generated dependency lockfile and SHA-256 hashes are included. Hashes support integrity checks; they are not signatures. The lockfile is not yet checked into the repository, so builds are not guaranteed reproducible.
 
 The current browser is experimental. A successful CI run is not a security audit or a rendering test.
+
+The packaged executable is also tested in a real window using `--smoke-startup`. It must initialize the engine and graphics context, submit its first interface frame, remain running briefly and exit cleanly. This checks startup, not web-page rendering or pixel correctness. Hosted runners may lack a usable graphics environment. The build package is retained for diagnosis even if the window test fails. Startup diagnostics are uploaded separately.
+
+To diagnose a local startup failure, run `start-lutra-diagnostic.bat` from the extracted package. It saves a local log and displays the exit code. No log is sent by the browser. Review its contents before sharing it.
