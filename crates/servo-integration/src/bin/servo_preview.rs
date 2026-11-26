@@ -4,6 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use browser_core::network_policy::NetworkPolicy;
 use browser_core::preferences::{Appearance, BrowserPreferences, SearchProvider};
 use browser_core::{native_tabs::{NativeTabs, MAX_TABS}, session::SessionDirectory, browser_features::{SessionLinks, wheel_lines}, BrowserState};
 use egui_glow::{CallbackFn, EguiGlow};
@@ -43,11 +44,39 @@ impl EventLoopWaker for Waker {
     }
 }
 
+const FIXTURE_URL: &str = "https://lutra-smoke.invalid/";
+const FIXTURE_TITLE: &str = "Lutra rendering fixture";
+
+struct ResourceDelegate {
+    policy: Rc<RefCell<NetworkPolicy>>,
+    fixture: bool,
+}
+
+impl ResourceDelegate {
+    fn handle(&self, load: servo::WebResourceLoad) {
+        let url = load.request().url.clone();
+        if self.fixture && url.host_str() == Some("lutra-smoke.invalid") {
+            let mut response = servo::WebResourceResponse::new(url);
+            response.headers.insert("content-type", "text/html; charset=utf-8".parse().expect("static header"));
+            let mut intercepted = load.intercept(response);
+            intercepted.send_body_data(include_bytes!("../smoke-fixture.html").to_vec());
+            intercepted.finish();
+        } else if self.policy.borrow_mut().should_block(&url) || self.fixture {
+            load.intercept(servo::WebResourceResponse::new(url)).cancel();
+        }
+    }
+}
+
+impl servo::ServoDelegate for ResourceDelegate {
+    fn load_web_resource(&self, load: servo::WebResourceLoad) { self.handle(load); }
+}
+
 struct Delegate {
     window: Rc<Window>,
     active: Cell<Option<servo::WebViewId>>,
     control: RefCell<Option<PageControl>>,
     fullscreen: Cell<Option<bool>>,
+    resources: Rc<ResourceDelegate>,
 }
 
 impl Delegate {
@@ -109,6 +138,8 @@ impl WebViewDelegate for Delegate {
         }
     }
 
+    fn load_web_resource(&self, _: WebView, load: servo::WebResourceLoad) { self.resources.handle(load); }
+
     fn request_permission(&self, _: WebView, request: PermissionRequest) {
         request.deny();
     }
@@ -144,6 +175,8 @@ enum Action {
     AddShortcut,
     RemoveShortcut(usize),
     OpenLink(Url),
+    AddDomain,
+    RemoveDomain(usize),
 }
 
 struct Engine {
@@ -178,6 +211,8 @@ struct Engine {
     filter: String,
     last_title: String,
     last_dark: Option<bool>,
+    domain_input: String,
+    rendered_fixture: bool,
 }
 
 fn session_options(session: &SessionDirectory) -> Opts {
@@ -212,7 +247,7 @@ fn window_icon() -> Option<Icon> {
 }
 
 impl Engine {
-    fn start(event_loop: &ActiveEventLoop, waker: Waker, initial: Option<Url>, session: &SessionDirectory) -> Result<Self, Box<dyn Error>> {
+    fn start(event_loop: &ActiveEventLoop, waker: Waker, initial: Option<Url>, session: &SessionDirectory, smoke_render: bool) -> Result<Self, Box<dyn Error>> {
         eprintln!("[Lutra] Initializing Servo");
         let servo = ServoBuilder::default()
             .opts(session_options(session))
@@ -220,6 +255,8 @@ impl Engine {
             .event_loop_waker(Box::new(waker))
             .build();
         servo.setup_logging();
+        let resources = Rc::new(ResourceDelegate { policy: Rc::new(RefCell::new(NetworkPolicy::default())), fixture: smoke_render });
+        servo.set_delegate(resources.clone());
         eprintln!("[Lutra] Servo initialized; creating window");
         let display = event_loop.display_handle()?;
         let window = Rc::new(event_loop.create_window(
@@ -247,7 +284,7 @@ impl Engine {
         visuals.selection.bg_fill = egui::Color32::from_rgb(56, 87, 127);
         gui.egui_ctx.set_visuals(visuals);
 
-        let delegate = Rc::new(Delegate { window: window.clone(), active: Cell::new(None), control: RefCell::new(None), fullscreen: Cell::new(None) });
+        let delegate = Rc::new(Delegate { window: window.clone(), active: Cell::new(None), control: RefCell::new(None), fullscreen: Cell::new(None), resources });
         let mut engine = Self {
             tabs: NativeTabs::default(),
             servo,
@@ -280,6 +317,8 @@ impl Engine {
             filter: String::new(),
             last_title: String::new(),
             last_dark: None,
+            domain_input: String::new(),
+            rendered_fixture: false,
         };
         if let Some(url) = initial {
             engine.apply(Action::Navigate(url));
@@ -330,6 +369,13 @@ impl Engine {
 
     fn apply(&mut self, action: Action) {
         match action {
+            Action::AddDomain => {
+                match self.delegate.resources.policy.borrow_mut().add_domain(&self.domain_input) {
+                    Ok(()) => { self.domain_input.clear(); self.status.clear(); }
+                    Err(error) => self.status = error.to_owned(),
+                }
+            }
+            Action::RemoveDomain(index) => { self.delegate.resources.policy.borrow_mut().remove_domain(index); }
             Action::OpenLink(url) => {
                 if self.tabs.slots().len() < self.settings.max_tabs && servo_integration::ServoAdapter::accepts(&url) {
                     self.apply(Action::NewTab);
@@ -497,8 +543,9 @@ impl Engine {
         }
         let mut action = None;
         let Self { tabs, gui, context, parent, window, address, address_dirty, focus_address,
-            status, viewport, viewport_scale, links, home_search, scroll_speed, show_history, show_bookmarks, show_settings, settings, shortcut_name, shortcut_url, filter, last_title, delegate, .. } = self;
+            status, viewport, viewport_scale, links, home_search, scroll_speed, show_history, show_bookmarks, show_settings, settings, shortcut_name, shortcut_url, filter, last_title, delegate, domain_input, .. } = self;
         let view = tabs.active();
+        let fixture_ready = delegate.resources.fixture && view.is_some_and(|view| matches!(view.load_status(), servo::LoadStatus::Complete) && view.page_title().as_deref() == Some(FIXTURE_TITLE));
 
         if !*address_dirty {
             if let Some(url) = view.and_then(WebView::url) {
@@ -630,6 +677,23 @@ impl Engine {
                         ui.separator();
                         ui.add(egui::Slider::new(scroll_speed, 0.5..=3.0).text("Scroll speed"));
                         if ui.button("Reset scroll speed").clicked() { *scroll_speed = 1.0; }
+                        ui.separator();
+                        ui.heading("Privacy");
+                        {
+                            let mut policy = delegate.resources.policy.borrow_mut();
+                            ui.label("HTTP resource requests blocked when handled by Servo callbacks.");
+                            ui.checkbox(&mut policy.block_known_domains, "Block starter tracker domains");
+                            ui.label(format!("Blocked requests: {}", policy.blocked_count()));
+                            ui.add(egui::TextEdit::singleline(domain_input).hint_text("tracker.example.com"));
+                            if ui.button("Block domain").clicked() { action = Some(Action::AddDomain); }
+                            for (index, domain) in policy.custom_domains().iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.label(domain);
+                                    if ui.small_button("×").clicked() { action = Some(Action::RemoveDomain(index)); }
+                                });
+                            }
+                            ui.label("Domain filtering is not a comprehensive ad blocker.");
+                        }
                         ui.label("Settings and browsing data are session-only.");
                         if ui.button("Close settings").clicked() { *show_settings = false; }
                     }
@@ -725,6 +789,7 @@ impl Engine {
             parent.prepare_for_rendering();
             gui.paint(window);
             parent.present();
+            if fixture_ready { self.rendered_fixture = true; }
             if !self.first_frame {
                 self.first_frame = true;
                 eprintln!("[Lutra] First interface frame submitted");
@@ -940,13 +1005,14 @@ struct App {
     engine: Option<Engine>,
     error: Option<String>,
     smoke: bool,
+    smoke_render: bool,
     smoke_exit_at: Option<Instant>,
 }
 
 impl ApplicationHandler<Wake> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if let Some((waker, url)) = self.initial.take() {
-            match Engine::start(event_loop, waker, url, &self.session) {
+            match Engine::start(event_loop, waker, url, &self.session, self.smoke_render) {
                 Ok(engine) => self.engine = Some(engine),
                 Err(error) => {
                     self.error = Some(error.to_string());
@@ -965,10 +1031,11 @@ impl ApplicationHandler<Wake> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(engine) = &mut self.engine else { return };
         if self.smoke {
-            if engine.first_frame {
+            if engine.first_frame && (!self.smoke_render || engine.rendered_fixture) {
                 let deadline = *self.smoke_exit_at.get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
                 if Instant::now() >= deadline {
-                    eprintln!("[Lutra] Startup smoke check passed");
+                    if self.smoke_render { eprintln!("[Lutra] Rendering fixture check passed"); }
+                    else { eprintln!("[Lutra] Startup smoke check passed"); }
                     event_loop.exit();
                     return;
                 }
@@ -1054,8 +1121,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         return check_config();
     }
     check_graphics_files()?;
-    let smoke = argument.as_deref() == Some("--smoke-startup");
-    let initial = if smoke { None } else { argument.map(|input| Url::parse(&input)).transpose()? };
+    let smoke_render = argument.as_deref() == Some("--smoke-render");
+    let smoke = smoke_render || argument.as_deref() == Some("--smoke-startup");
+    let initial = if smoke_render { Some(Url::parse(FIXTURE_URL)?) } else if smoke { None } else { argument.map(|input| Url::parse(&input)).transpose()? };
     if initial.as_ref().is_some_and(|url| !servo_integration::ServoAdapter::accepts(url)) {
         return Err("Only HTTPS websites without credentials are supported".into());
     }
@@ -1067,6 +1135,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         engine: None,
         error: None,
         smoke,
+        smoke_render,
         smoke_exit_at: None,
     };
     let run_result = event_loop.run_app(&mut app);

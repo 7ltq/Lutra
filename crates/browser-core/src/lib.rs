@@ -3,6 +3,7 @@ use url::Url;
 pub mod native_tabs;
 pub mod browser_features;
 pub mod preferences;
+pub mod network_policy;
 pub mod session;
 
 #[derive(Clone, Debug)]
