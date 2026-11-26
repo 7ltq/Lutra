@@ -1,6 +1,7 @@
 use url::Url;
 
 pub mod native_tabs;
+pub mod browser_features;
 pub mod session;
 
 #[derive(Clone, Debug)]

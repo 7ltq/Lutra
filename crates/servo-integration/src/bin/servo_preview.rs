@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use browser_core::{native_tabs::{NativeTabs, MAX_TABS}, session::SessionDirectory, BrowserState};
+use browser_core::{native_tabs::{NativeTabs, MAX_TABS}, session::SessionDirectory, browser_features::{SessionLinks, wheel_lines}, BrowserState};
 use egui_glow::{CallbackFn, EguiGlow};
 use euclid::{Point2D, Rect, Scale, Size2D};
 use servo::{
@@ -49,6 +49,10 @@ impl WebViewDelegate for Delegate {
         self.0.request_redraw();
     }
 
+    fn notify_page_title_changed(&self, _: WebView, _: Option<String>) {
+        self.0.request_redraw();
+    }
+
     fn notify_history_changed(&self, _: WebView, _: Vec<Url>, _: usize) {
         self.0.request_redraw();
     }
@@ -82,6 +86,13 @@ enum Action {
     Back,
     Forward,
     Reload,
+    Home,
+    Reopen,
+    Bookmark,
+    RemoveBookmark(Url),
+    ClearHistory,
+    Zoom(f32),
+    ResetZoom,
 }
 
 struct Engine {
@@ -104,6 +115,12 @@ struct Engine {
     viewport_scale: f32,
     next_animation: Instant,
     first_frame: bool,
+    home_search: String,
+    links: SessionLinks,
+    scroll_speed: f32,
+    show_history: bool,
+    show_bookmarks: bool,
+    show_settings: bool,
 }
 
 fn session_options(session: &SessionDirectory) -> Opts {
@@ -150,7 +167,7 @@ impl Engine {
         let display = event_loop.display_handle()?;
         let window = Rc::new(event_loop.create_window(
             Window::default_attributes()
-                .with_title("Lutra — experimental browser")
+                .with_title("Lutra")
                 .with_visible(false)
                 .with_window_icon(window_icon())
                 .with_inner_size(LogicalSize::new(1180.0, 760.0))
@@ -169,8 +186,8 @@ impl Engine {
         eprintln!("[Lutra] Initializing interface painter");
         let gui = EguiGlow::new(event_loop, context.glow_gl_api(), None, None, false);
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(16, 28, 54);
-        visuals.selection.bg_fill = egui::Color32::from_rgb(54, 79, 120);
+        visuals.panel_fill = egui::Color32::from_rgb(24, 25, 29);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(56, 87, 127);
         gui.egui_ctx.set_visuals(visuals);
 
         let delegate = Rc::new(Delegate(window.clone()));
@@ -194,6 +211,12 @@ impl Engine {
             viewport_scale: 1.0,
             next_animation: Instant::now(),
             first_frame: false,
+            home_search: String::new(),
+            links: SessionLinks::default(),
+            scroll_speed: 1.0,
+            show_history: false,
+            show_bookmarks: false,
+            show_settings: false,
         };
         if let Some(url) = initial {
             engine.apply(Action::Navigate(url));
@@ -232,6 +255,7 @@ impl Engine {
         self.address = self.tabs.active().and_then(WebView::url).map(|url| url.to_string()).unwrap_or_default();
         self.address_dirty = false;
         self.focus_address = self.tabs.active().is_none();
+        self.home_search.clear();
         if changed {
             self.status.clear();
         }
@@ -239,6 +263,36 @@ impl Engine {
 
     fn apply(&mut self, action: Action) {
         match action {
+            Action::Home => {
+                if self.tabs.active().is_some() {
+                    self.apply(Action::NewTab);
+                } else {
+                    self.focus_address = true;
+                }
+            }
+            Action::Reopen => {
+                if self.tabs.slots().len() < MAX_TABS {
+                    if let Some(url) = self.links.reopen() {
+                        self.apply(Action::NewTab);
+                        self.apply(Action::Navigate(url));
+                    }
+                }
+            }
+            Action::Bookmark => {
+                if let Some(url) = self.tabs.active().and_then(WebView::url) {
+                    self.links.toggle_bookmark(url);
+                }
+            }
+            Action::RemoveBookmark(url) => { self.links.remove_bookmark(&url); }
+            Action::ClearHistory => { self.links.clear_history(); }
+            Action::Zoom(factor) => {
+                if let Some(view) = self.tabs.active() {
+                    view.set_page_zoom((view.page_zoom() * factor).clamp(0.5, 3.0));
+                }
+            }
+            Action::ResetZoom => {
+                if let Some(view) = self.tabs.active() { view.set_page_zoom(1.0); }
+            }
             Action::NewTab => {
                 if self.tabs.slots().len() >= MAX_TABS {
                     self.status = "Tab limit reached.".into();
@@ -252,6 +306,9 @@ impl Engine {
                 }
             }
             Action::Close(index) => {
+                if let Some(url) = self.tabs.slots().get(index).and_then(Option::as_ref).and_then(WebView::url) {
+                    self.links.record_closed(url);
+                }
                 if index == self.tabs.active_index() {
                     self.switch(|tabs| tabs.close(index));
                 } else {
@@ -266,7 +323,10 @@ impl Engine {
                 self.address = url.to_string();
                 self.address_dirty = false;
                 self.status.clear();
-                self.focus_page(false);
+                self.gui.egui_ctx.memory_mut(|memory| {
+                    if let Some(id) = memory.focused() { memory.surrender_focus(id); }
+                });
+                self.focus_page(true);
                 if let Some(view) = self.tabs.active() {
                     view.load(url);
                 } else {
@@ -276,7 +336,7 @@ impl Engine {
                         .delegate(self.delegate.clone())
                         .build();
                     view.show();
-                    view.set_focused(false);
+                    view.set_focused(self.window_focus);
                     let _ = self.tabs.insert_active(view);
                 }
             }
@@ -311,9 +371,12 @@ impl Engine {
             return;
         }
 
+        if let Some(url) = self.tabs.active().and_then(WebView::url) {
+            self.links.record_visit(url);
+        }
         let mut action = None;
         let Self { tabs, gui, context, parent, window, address, address_dirty, focus_address,
-            status, viewport, viewport_scale, .. } = self;
+            status, viewport, viewport_scale, links, home_search, scroll_speed, show_history, show_bookmarks, show_settings, .. } = self;
         let view = tabs.active();
 
         if !*address_dirty {
@@ -324,9 +387,11 @@ impl Engine {
             }
         }
 
+        let caption = view.and_then(WebView::page_title).filter(|title| !title.is_empty()).unwrap_or_else(|| "New tab".into());
+        window.set_title(&format!("{} — Lutra", caption));
         gui.run(window, |ui| {
             egui::Panel::top("tabs")
-                .frame(egui::Frame::new().fill(egui::Color32::from_rgb(12, 23, 46)).inner_margin(6))
+                .frame(egui::Frame::new().fill(egui::Color32::from_rgb(18, 19, 22)).inner_margin(6))
                 .show_inside(ui, |ui| {
                     ui.horizontal(|ui| {
                         if ui.add_enabled(tabs.slots().len() < MAX_TABS, egui::Button::new("+")).clicked() {
@@ -336,9 +401,9 @@ impl Engine {
                             ui.horizontal(|ui| {
                                 for (index, slot) in tabs.slots().iter().enumerate() {
                                     let url = slot.as_ref().and_then(WebView::url);
-                                    let title = url.as_ref().and_then(Url::host_str).unwrap_or("New tab");
+                                    let title = slot.as_ref().and_then(WebView::page_title).filter(|title| !title.is_empty()).unwrap_or_else(|| url.as_ref().and_then(Url::host_str).unwrap_or("New tab").to_owned());
                                     let text: String = title.chars().take(28).collect();
-                                    if ui.selectable_label(index == tabs.active_index(), text).clicked() {
+                                    if ui.selectable_label(index == tabs.active_index(), text).on_hover_text(title).clicked() {
                                         action = Some(Action::Select(index));
                                     }
                                     if ui.small_button("×").clicked() {
@@ -351,10 +416,10 @@ impl Engine {
                 });
 
             egui::Panel::top("browser_controls")
-                .frame(egui::Frame::new().fill(egui::Color32::from_rgb(16, 28, 54)).inner_margin(8))
+                .frame(egui::Frame::new().fill(egui::Color32::from_rgb(29, 30, 35)).inner_margin(8))
                 .show_inside(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Lutra").strong().color(egui::Color32::from_rgb(255, 197, 64)));
+                        if ui.button("⌂").on_hover_text("Home").clicked() { action = Some(Action::Home); }
                         if ui.add_enabled(view.is_some_and(WebView::can_go_back), egui::Button::new("‹")).clicked() {
                             action = Some(Action::Back);
                         }
@@ -364,7 +429,7 @@ impl Engine {
                         if ui.add_enabled(view.is_some(), egui::Button::new("Reload")).clicked() {
                             action = Some(Action::Reload);
                         }
-                        let width = (ui.available_width() - 56.0).max(80.0);
+                        let width = (ui.available_width() - 114.0).max(80.0);
                         let field = ui.add_sized([width, 29.0], egui::TextEdit::singleline(&mut *address).hint_text("Search or enter an address"));
                         if field.changed() {
                             *address_dirty = true;
@@ -375,6 +440,9 @@ impl Engine {
                         }
                         let enter = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
                         let go = ui.button("Go").clicked();
+                        let bookmarked = view.and_then(WebView::url).is_some_and(|url| links.bookmarks().contains(&url));
+                        if ui.add_enabled(view.is_some(), egui::Button::new(if bookmarked { "★" } else { "☆" })).on_hover_text("Bookmark (session only)").clicked() { action = Some(Action::Bookmark); }
+                        if ui.button("⋯").on_hover_text("Browser settings").clicked() { *show_settings = !*show_settings; }
                         if enter || go {
                             match BrowserState::parse_address(address) {
                                 Ok(url) => action = Some(Action::Navigate(url)),
@@ -384,12 +452,56 @@ impl Engine {
                     });
                     let origin = view.and_then(WebView::url).filter(servo_integration::ServoAdapter::accepts)
                         .map(|url| url.origin().ascii_serialization());
-                    ui.label(egui::RichText::new(origin.as_deref().unwrap_or("No page loaded")).small());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(origin.as_deref().unwrap_or("Private new tab")).small());
+                        if let Some(view) = view {
+                            if ui.small_button("−").clicked() { action = Some(Action::Zoom(1.0 / 1.1)); }
+                            if ui.small_button(format!("{:.0}%", view.page_zoom() * 100.0)).on_hover_text("Reset zoom").clicked() { action = Some(Action::ResetZoom); }
+                            if ui.small_button("+").clicked() { action = Some(Action::Zoom(1.1)); }
+                        }
+                        if ui.small_button("Bookmarks").clicked() { *show_bookmarks = !*show_bookmarks; }
+                        if ui.small_button("History").clicked() { *show_history = !*show_history; }
+                    });
                     if !status.is_empty() {
                         ui.label(status.as_str());
                     }
                 });
 
+            if *show_settings || *show_history || *show_bookmarks {
+                egui::Panel::right("browser_sidebar").show_inside(ui, |ui| {
+                    if *show_settings {
+                        ui.heading("Settings");
+                        ui.add(egui::Slider::new(scroll_speed, 0.5..=3.0).text("Scroll speed"));
+                        if ui.button("Reset scroll speed").clicked() { *scroll_speed = 1.0; }
+                        ui.label("Settings and browsing data are session-only.");
+                        if ui.button("Close settings").clicked() { *show_settings = false; }
+                    }
+                    if *show_bookmarks {
+                        ui.heading("Bookmarks");
+                        egui::ScrollArea::vertical().id_salt("bookmarks").max_height(220.0).show(ui, |ui| {
+                            for url in links.bookmarks().iter().rev() {
+                                ui.horizontal(|ui| {
+                                    if ui.button(url.host_str().unwrap_or("Website")).on_hover_text(url.as_str()).clicked() { action = Some(Action::Navigate(url.clone())); }
+                                    if ui.small_button("×").clicked() { action = Some(Action::RemoveBookmark(url.clone())); }
+                                });
+                            }
+                        });
+                        if links.bookmarks().is_empty() { ui.label("No bookmarks in this session."); }
+                        if ui.button("Close bookmarks").clicked() { *show_bookmarks = false; }
+                    }
+                    if *show_history {
+                        ui.heading("Session history");
+                        if ui.button("Clear list").clicked() { action = Some(Action::ClearHistory); }
+                        if ui.button("Reopen closed tab").clicked() { action = Some(Action::Reopen); }
+                        egui::ScrollArea::vertical().id_salt("history").max_height(240.0).show(ui, |ui| {
+                            for url in links.history().iter().rev() {
+                                if ui.button(url.host_str().unwrap_or("Website")).on_hover_text(url.as_str()).clicked() { action = Some(Action::Navigate(url.clone())); }
+                            }
+                        });
+                        if ui.button("Close history").clicked() { *show_history = false; }
+                    }
+                });
+            }
             let rect = ui.available_rect_before_wrap();
             let scale = ui.ctx().pixels_per_point();
             *viewport = rect;
@@ -419,11 +531,27 @@ impl Engine {
             } else {
                 ui.vertical_centered(|ui| {
                     ui.add_space((rect.height() * 0.2).max(0.0));
-                    ui.label(egui::RichText::new("Lutra").size(42.0).color(egui::Color32::from_rgb(255, 197, 64)));
-                    ui.label("A browser in development.");
-                    ui.label("No page is opened until you enter an address.");
-                    ui.add_space(8.0);
-                    ui.label("Do not rely on this build for sensitive browsing.");
+                    ui.label(egui::RichText::new("Lutra").size(54.0).strong());
+                    ui.label(egui::RichText::new("A quieter way to browse").size(16.0).color(egui::Color32::GRAY));
+                    ui.add_space(22.0);
+                    let search = ui.add_sized([(rect.width() * 0.65).clamp(160.0, 560.0), 40.0], egui::TextEdit::singleline(home_search).hint_text("Search the web or enter a URL"));
+                    if (search.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))) || ui.button("Search").clicked() {
+                        match BrowserState::parse_address(home_search) {
+                            Ok(url) => { action = Some(Action::Navigate(url)); home_search.clear(); }
+                            Err(error) => *status = error.to_owned(),
+                        }
+                    }
+                    ui.add_space(20.0);
+                    ui.horizontal(|ui| {
+                        for (name, url) in [("DuckDuckGo", "https://duckduckgo.com/"), ("Wikipedia", "https://www.wikipedia.org/"), ("GitHub", "https://github.com/")] {
+                            if ui.button(name).clicked() {
+                                if let Ok(url) = Url::parse(url) { action = Some(Action::Navigate(url)); }
+                            }
+                        }
+                    });
+                    ui.add_space(28.0);
+                    ui.label("Private session · no persistent browsing history");
+                    ui.label(egui::RichText::new("Experimental engine — not for sensitive browsing").small().color(egui::Color32::GRAY));
                 });
             }
         });
@@ -446,6 +574,7 @@ impl Engine {
     }
 
     fn handle(&mut self, event: WindowEvent) {
+        let page_pointer = self.tabs.active().is_some() && self.cursor.is_some();
         let response = self.gui.on_window_event(&self.window, &event);
         if response.repaint && !matches!(&event, WindowEvent::RedrawRequested) {
             self.window.request_redraw();
@@ -483,9 +612,9 @@ impl Engine {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if state == ElementState::Pressed {
-                    self.focus_page(self.cursor.is_some() && self.tabs.active().is_some() && !response.consumed);
+                    self.focus_page(page_pointer);
                 }
-                if !response.consumed {
+                if page_pointer {
                     if let Some(point) = self.cursor {
                         let button = match button {
                             WinitButton::Left => MouseButton::Primary,
@@ -503,13 +632,21 @@ impl Engine {
                     }
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } if !response.consumed => {
+            WindowEvent::MouseWheel { delta, .. } if page_pointer => {
                 if let Some(point) = self.cursor {
                     let (x, y, mode) = match delta {
-                        MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y), WheelMode::DeltaLine),
+                        MouseScrollDelta::LineDelta(x, y) => {
+                            let (x, y) = wheel_lines(x, y, self.scroll_speed);
+                            (x, y, WheelMode::DeltaLine)
+                        }
                         MouseScrollDelta::PixelDelta(p) => (p.x, p.y, WheelMode::DeltaPixel),
                     };
-                    self.input(InputEvent::Wheel(WheelEvent::new(WheelDelta { x, y, z: 0.0, mode }, point.into())));
+                    if self.modifiers.contains(Modifiers::CONTROL) && y != 0.0 {
+                        self.apply(Action::Zoom(if y > 0.0 { 1.1 } else { 1.0 / 1.1 }));
+                    } else {
+                        self.input(InputEvent::Wheel(WheelEvent::new(WheelDelta { x, y, z: 0.0, mode }, point.into())));
+                        self.window.request_redraw();
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(value) => {
@@ -528,10 +665,31 @@ impl Engine {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed && !event.repeat {
+                    let shortcut = match &event.logical_key {
+                        WinitKey::Named(WinitNamedKey::F5) => Some(Action::Reload),
+                        WinitKey::Named(WinitNamedKey::ArrowLeft) if self.modifiers.contains(Modifiers::ALT) => Some(Action::Back),
+                        WinitKey::Named(WinitNamedKey::ArrowRight) if self.modifiers.contains(Modifiers::ALT) => Some(Action::Forward),
+                        WinitKey::Named(WinitNamedKey::Home) if self.modifiers.contains(Modifiers::ALT) => Some(Action::Home),
+                        WinitKey::Named(WinitNamedKey::Tab) if self.modifiers.contains(Modifiers::CONTROL) => {
+                            let len = self.tabs.slots().len();
+                            let offset = if self.modifiers.contains(Modifiers::SHIFT) { len - 1 } else { 1 };
+                            Some(Action::Select((self.tabs.active_index() + offset) % len))
+                        }
+                        _ => None,
+                    };
+                    if let Some(action) = shortcut { self.apply(action); return; }
+                }
                 if self.modifiers.contains(Modifiers::CONTROL) {
                     if let WinitKey::Character(key) = &event.logical_key {
                         let shortcut = match key.to_ascii_lowercase().as_str() {
+                            "t" if self.modifiers.contains(Modifiers::SHIFT) => Some(Action::Reopen),
                             "t" => Some(Action::NewTab),
+                            "r" => Some(Action::Reload),
+                            "d" => Some(Action::Bookmark),
+                            "+" | "=" => Some(Action::Zoom(1.1)),
+                            "-" => Some(Action::Zoom(1.0 / 1.1)),
+                            "0" => Some(Action::ResetZoom),
                             "w" => Some(Action::Close(self.tabs.active_index())),
                             "l" => {
                                 if event.state == ElementState::Pressed {
@@ -551,7 +709,7 @@ impl Engine {
                         }
                     }
                 }
-                if self.page_focus && self.window_focus && !response.consumed {
+                if self.page_focus && self.window_focus {
                     if let Some(key) = translate_key(&event.logical_key) {
                         let state = match event.state {
                             ElementState::Pressed => KeyState::Down,
