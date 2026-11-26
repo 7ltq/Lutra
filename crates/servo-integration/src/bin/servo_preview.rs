@@ -698,6 +698,23 @@ fn check_config() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn check_graphics_files() -> Result<(), Box<dyn Error>> {
+    let executable = std::env::current_exe()?;
+    let directory = executable.parent().ok_or("Executable directory unavailable")?;
+    for name in ["libEGL.dll", "libGLESv2.dll"] {
+        if !directory.join(name).is_file() {
+            return Err(format!("Required graphics library is missing: {name}. Extract the complete Lutra package.").into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn check_graphics_files() -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
@@ -706,6 +723,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if argument.as_deref() == Some("--check-config") {
         return check_config();
     }
+    check_graphics_files()?;
     let smoke = argument.as_deref() == Some("--smoke-startup");
     let initial = if smoke { None } else { argument.map(|input| Url::parse(&input)).transpose()? };
     if initial.as_ref().is_some_and(|url| !servo_integration::ServoAdapter::accepts(url)) {

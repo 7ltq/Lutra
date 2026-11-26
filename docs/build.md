@@ -8,6 +8,8 @@ Artifacts are uploaded only after compilation and the configuration check succee
 
 The current browser is experimental. A successful CI run is not a security audit or a rendering test.
 
-The packaged executable is also tested in a real window using `--smoke-startup`. It must initialize the engine and graphics context, submit its first interface frame, remain running briefly and exit cleanly. This checks startup, not web-page rendering or pixel correctness. Hosted runners may lack a usable graphics environment. The build package is retained for diagnosis even if the window test fails. Startup diagnostics are uploaded separately.
+The packaged executable is also tested in a real window using `--smoke-startup`. It must initialize the engine and graphics context, submit its first interface frame, remain running briefly and exit cleanly. This checks startup, not web-page rendering or pixel correctness. Hosted runners may lack a usable graphics environment. The normal Windows package is uploaded only after the window startup check passes. A failed startup package is retained separately for diagnosis. Startup diagnostics are uploaded separately.
 
 To diagnose a local startup failure, run `start-lutra-diagnostic.bat` from the extracted package. It saves a local log and displays the exit code. No log is sent by the browser. Review its contents before sharing it.
+
+On Windows, Servo uses ANGLE to provide EGL and OpenGL ES. The two DLLs, `libEGL.dll` and `libGLESv2.dll`, are generated inside the mozangle build directory. The build script stages the matching pair beside the executable and fails if the pair is missing or ambiguous. The package checks that both files are present. The executable checks their presence before creating its graphics context. A file-presence check does not establish that a library can be loaded on every system.
