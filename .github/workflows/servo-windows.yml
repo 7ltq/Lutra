@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   renderer:
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 90
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
@@ -40,14 +40,29 @@ jobs:
       - name: Install LLVM
         uses: KyleMayes/install-llvm-action@v2
         with:
-          version: "20.1"
+          version: "20.1.8"
           directory: ${{ runner.temp }}/llvm
       - name: Configure libclang
         run: |
           "LIBCLANG_PATH=$(Join-Path $env:LLVM_PATH 'bin')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Check C++ toolchain compatibility
+        run: |
+          $clang = Join-Path $env:LIBCLANG_PATH 'clang-cl.exe'
+          & $clang --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $source = Join-Path $env:RUNNER_TEMP 'lutra-toolchain-check.cpp'
+          @'
+          #include <vector>
+          int main() { std::vector<int> values{1, 2}; return values[0]; }
+          '@ | Set-Content -Path $source -Encoding ascii
+          & $clang /nologo /TP /std:c++17 -fsyntax-only $source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/servo-integration -> C:/lt-target
+          prefix-key: lutra-servo-vs2022-llvm20
+          workspaces: crates/servo-integration
+          cache-targets: false
+          cache-directories: C:/lt-target
           cache-on-failure: true
       - name: Resolve engine dependencies
         run: cargo +1.97.1 fetch --manifest-path crates/servo-integration/Cargo.toml
