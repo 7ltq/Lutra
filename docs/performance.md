@@ -19,3 +19,5 @@ The sum of process working sets can count shared pages more than once. Private m
 The renderer limit is currently a process-count limit, not a memory limit. Automatic suspension is not enabled.
 
 The experimental renderer now uses an offscreen GPU rendering context for the page and composites it into the same window as the navigation controls. This avoids an explicit CPU readback in the composition path. It still allocates GPU resources and has not been benchmarked. The event loop waits when the page is not animating, and uses a timed wake for animation while the window is visible.
+
+Native tabs share an engine and GPU rendering context. Empty tabs do not allocate a web view. Selecting a tab hides the previous view; closing a tab drops its owned view. Hiding a view is not suspension, and does not promise that the page stops executing. The native tab count is capped at 32, not by measured memory use. Benchmark these changes before making claims about savings.
