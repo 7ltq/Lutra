@@ -1,0 +1,19 @@
+# Measuring resource use
+
+There are no verified memory or CPU measurements for Lutra yet.
+
+The shell and renderer are separate processes. A measurement of the shell alone is not a measurement of a working browser.
+
+On Windows, run the following while Lutra is open:
+
+```powershell
+.\scripts\measure-resources.ps1 -RootProcessId 1234 -Seconds 30
+```
+
+Replace 1234 with the process ID of the browser interface. The script samples the interface and its observed descendants. It reports private memory, working set and CPU time locally. It does not transmit the results.
+
+Run the same workload with an empty browser, one page, and several pages. Repeat the measurement after a fixed warm-up period and use the same pages, hardware and power settings.
+
+The sum of process working sets can count shared pages more than once. Private memory is not the same as physical RAM. Short-lived processes can escape sampling, and PID reuse is a limitation. The script does not measure GPU memory.
+
+The renderer limit is currently a process-count limit, not a memory limit. Automatic suspension is not enabled.

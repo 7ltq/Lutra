@@ -4,9 +4,10 @@ use eframe::egui::{self, Color32, RichText};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_PREVIEWS: usize = 3;
+const REAP_INTERVAL: Duration = Duration::from_secs(2);
 
 struct BrowserApp {
     browser: BrowserState,
@@ -16,6 +17,7 @@ struct BrowserApp {
     resources: ResourceManager,
     preview_executable: Option<PathBuf>,
     previews: HashMap<u64, Child>,
+    next_reap: Instant,
 }
 
 impl Default for BrowserApp {
@@ -25,7 +27,7 @@ impl Default for BrowserApp {
         let mut resources = ResourceManager::default();
         resources.register(initial);
         resources.activate(initial);
-        Self { browser, address: String::new(), status: "Servo preview available after building the engine".into(), dark: true, resources, preview_executable: find_preview(), previews: HashMap::new() }
+        Self { browser, address: String::new(), status: "Servo preview available after building the engine".into(), dark: true, resources, preview_executable: find_preview(), previews: HashMap::new(), next_reap: Instant::now() }
     }
 }
 
@@ -87,7 +89,7 @@ impl BrowserApp {
             return Err(format!("Could not stop previous renderer: {error}"));
         }
         match Command::new(executable).arg(url).stdin(Stdio::null()).spawn() {
-            Ok(child) => { self.previews.insert(id, child); Ok(()) }
+            Ok(child) => { self.previews.insert(id, child); self.next_reap = Instant::now() + REAP_INTERVAL; Ok(()) }
             Err(error) => Err(format!("Could not start Servo: {error}")),
         }
     }
@@ -105,8 +107,16 @@ impl Drop for BrowserApp {
 
 impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        self.reap_previews();
-        if !self.previews.is_empty() { ctx.request_repaint_after(Duration::from_secs(2)); }
+        if !self.previews.is_empty() {
+            let now = Instant::now();
+            if now >= self.next_reap {
+                self.reap_previews();
+                self.next_reap = now + REAP_INTERVAL;
+            }
+            if !self.previews.is_empty() {
+                ctx.request_repaint_after(self.next_reap.saturating_duration_since(now));
+            }
+        }
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -159,9 +169,9 @@ impl eframe::App for BrowserApp {
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() * 0.22);
                 ui.heading(RichText::new("Lutra").size(36.0));
-                ui.label(RichText::new("Privacy by design. Speed by default.").color(Color32::GRAY));
+                ui.label(RichText::new("A browser in development.").color(Color32::GRAY));
                 ui.add_space(24.0);
-                ui.label("Native Rust shell · Servo rendering opens in a separate window");
+                ui.label("Web pages open in an experimental Servo window. Privacy protections are not yet enforced.");
                 ui.label(format!("Renderer processes: {} / {}", self.previews.len(), MAX_PREVIEWS));
                 if let Some(id) = self.browser.active_id() {
                     if self.previews.contains_key(&id) && ui.button("Stop renderer").clicked() {

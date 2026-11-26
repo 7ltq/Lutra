@@ -1,15 +1,33 @@
 # Lutra
 
-Rust-first Windows browser prototype with an experimental Servo renderer.
+A web browser in development. Built with Rust and Servo.
 
-## Build
+The aim is to give people more control over their browsing, without making the browser a source of unnecessary data collection. It should use no more resources than it needs.
 
-Install stable Rust and Microsoft C++ Build Tools. Run `build.bat` for the shell, `test.bat` for tests, or `build-all.bat` for the experimental renderer and shell.
+## Before you use Lutra
 
-The shell and renderer are separate executables. Native in-tab rendering, sandboxing, privacy enforcement, automatic tab suspension and measured resource savings are not implemented. The preview process limit is not a RAM budget.
+Lutra is an experimental project, not a browser ready for daily use. Do not rely on it for sensitive browsing.
 
-The Windows workflow tests and builds the shell. The experimental Servo check is manually enabled. The approved otter artwork is represented here by a reduced-resolution application icon; the original artwork and multi-resolution ICO are retained in the v0.7.0 source archive.
+The interface and the web engine currently run separately. Site isolation, sandboxing, tracking protection, storage partitioning and resistance to browser fingerprinting have not been implemented. The privacy settings in the source code do not yet enforce these protections.
+
+Lutra does not include its own telemetry service. This does not prevent websites, network providers or engine dependencies from communicating over the network. Lutra does not hide your IP address.
+
+We have not established how much memory the browser uses. We intend to publish measurements rather than estimates.
+
+## Build on Windows
+
+Install Rust and the Visual Studio C++ build tools. For the engine, also follow the [Servo Windows build instructions](https://book.servo.org/building/windows.html) and [embedding instructions](https://book.servo.org/embedding/overview.html).
+
+- `build.bat`: build the interface.
+- `test.bat`: run the workspace tests.
+- `build-all.bat`: build the experimental Servo renderer and start the interface.
+
+The experimental renderer targets Servo v0.7.0. The Windows workflow tests the interface on each push. The renderer build is opt-in through the workflow dispatch input. A green interface build does not establish that Servo works.
+
+See [the build results](https://github.com/7ltq/Lutra/actions) for the state of each revision.
 
 ## Development
 
-Prioritize native Servo integration, verified Windows builds, low idle CPU usage, measured memory consumption and isolation. No performance or security guarantees are made.
+The next step is to render web pages inside the browser window. After that, we can measure resource use and implement browser protections at the engine boundary.
+
+Lutra is an independent project. It is not affiliated with Mullvad, the Tor Project or Servo.
