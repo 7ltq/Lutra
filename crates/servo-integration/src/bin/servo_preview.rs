@@ -63,7 +63,7 @@ impl WebViewDelegate for Delegate {
     }
 
     fn request_navigation(&self, _: WebView, request: NavigationRequest) {
-        if servo_integration::ServoAdapter::accepts(&request.url) {
+        if request.url.as_str() == "about:blank" || servo_integration::ServoAdapter::accepts(&request.url) {
             request.allow();
         } else {
             request.deny();
@@ -435,9 +435,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| "Could not initialize TLS")?;
-    let input = std::env::args().nth(1).ok_or("A URL is required")?;
+    let input = std::env::args().nth(1).unwrap_or_else(|| "about:blank".to_owned());
     let url = Url::parse(&input)?;
-    if !servo_integration::ServoAdapter::accepts(&url) {
+    if url.as_str() != "about:blank" && !servo_integration::ServoAdapter::accepts(&url) {
         return Err("Only HTTP and HTTPS URLs without credentials are supported".into());
     }
     let event_loop = EventLoop::<Wake>::with_user_event().build()?;

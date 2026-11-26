@@ -29,8 +29,26 @@ jobs:
         with:
           workspaces: crates/servo-integration -> target
       - run: cargo +1.97.1 build --release --manifest-path crates/servo-integration/Cargo.toml --features servo-experimental --bin servo-preview
+      - name: Package Windows runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadata = cargo +1.97.1 metadata --no-deps --format-version 1 --manifest-path crates/servo-integration/Cargo.toml | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo metadata failed' }
+          $release = Join-Path $metadata.target_directory 'release'
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'lutra-servo-windows'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item (Join-Path $release 'servo-preview.exe') $stage
+          $angle = Get-ChildItem (Join-Path $release 'build') -Recurse -File -Filter 'libEGL.dll' |
+            Where-Object { $_.FullName -match '[\\/]mozangle-' -and (Test-Path (Join-Path $_.DirectoryName 'libGLESv2.dll')) } |
+            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+          if (-not $angle) { throw 'Matching ANGLE runtime DLLs were not found' }
+          Copy-Item $angle.FullName $stage
+          Copy-Item (Join-Path $angle.DirectoryName 'libGLESv2.dll') $stage
+          Copy-Item scripts/diagnose-windows.bat $stage
+          Get-ChildItem $stage | Format-Table Name, Length
       - uses: actions/upload-artifact@v4
         with:
           name: lutra-servo-windows
-          path: crates/servo-integration/target/release/servo-preview.exe
+          path: lutra-servo-windows/
           if-no-files-found: error
