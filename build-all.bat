@@ -1,9 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-rustup toolchain install 1.97.1 --profile minimal
-if errorlevel 1 goto fail
-cargo +1.97.1 build --release --manifest-path crates/servo-integration/Cargo.toml --target-dir target --features servo-experimental --bin servo-preview
+powershell -NoProfile -File "scripts\build-servo.ps1" -TargetDirectory "%~dp0target"
 if errorlevel 1 goto fail
 "target\release\servo-preview.exe"
 exit /b %errorlevel%

@@ -554,6 +554,8 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         if self.context.make_current().is_ok() {
+            self.tabs = NativeTabs::default();
+            self.servo.spin_event_loop();
             self.gui.destroy();
         }
     }
@@ -639,11 +641,38 @@ impl ApplicationHandler<Wake> for App {
     }
 }
 
+fn check_config() -> Result<(), Box<dyn Error>> {
+    let session = SessionDirectory::create()?;
+    let path = session.path().to_path_buf();
+    let opts = session_options(&session);
+    let prefs = restricted_preferences();
+    if !opts.temporary_storage || opts.ignore_certificate_errors
+        || opts.config_dir.as_deref() != Some(path.as_path())
+        || prefs.devtools_server_enabled || prefs.dom_webrtc_enabled
+        || prefs.dom_webrtc_transceiver_enabled || prefs.dom_geolocation_enabled
+        || prefs.dom_bluetooth_enabled || prefs.dom_bluetooth_testing_enabled
+        || prefs.dom_gamepad_enabled || prefs.dom_webxr_enabled
+        || prefs.dom_credential_management_enabled || prefs.dom_async_clipboard_enabled
+    {
+        return Err("Unexpected engine configuration".into());
+    }
+    session.close()?;
+    if path.exists() {
+        return Err("Session directory was not removed".into());
+    }
+    println!("Configuration and session cleanup checks passed.");
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| "Could not initialize TLS")?;
-    let initial = std::env::args().nth(1).map(|input| Url::parse(&input)).transpose()?;
+    let argument = std::env::args().nth(1);
+    if argument.as_deref() == Some("--check-config") {
+        return check_config();
+    }
+    let initial = argument.map(|input| Url::parse(&input)).transpose()?;
     if initial.as_ref().is_some_and(|url| !servo_integration::ServoAdapter::accepts(url)) {
         return Err("Only HTTPS websites without credentials are supported".into());
     }

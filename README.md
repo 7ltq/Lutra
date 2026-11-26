@@ -26,7 +26,7 @@ Install Rust, the Visual Studio C++ build tools and the prerequisites in the [Se
 
 Run `build-all.bat` to build and launch the native experimental browser. The legacy interface can still be built with `build.bat`. Use `test.bat` for the workspace tests.
 
-The experimental engine targets Servo v0.7.0. See [build results](https://github.com/7ltq/Lutra/actions) for each revision. Compilation is not a runtime or security test.
+The experimental engine uses the published Servo 0.7.0 Cargo package. We do not download the entire Servo source repository to build the browser. The Windows build runs a configuration and session cleanup check before publishing an artifact. This check does not start the graphics engine or verify page rendering. See [build results](https://github.com/7ltq/Lutra/actions) for each revision. Compilation is not a runtime or security test.
 
 ## Development
 
