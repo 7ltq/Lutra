@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use browser_core::{native_tabs::{NativeTabs, MAX_TABS}, BrowserState};
+use browser_core::{native_tabs::{NativeTabs, MAX_TABS}, session::SessionDirectory, BrowserState};
 use egui_glow::{CallbackFn, EguiGlow};
 use euclid::{Point2D, Rect, Scale, Size2D};
 use servo::{
@@ -11,7 +11,7 @@ use servo::{
     Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
     MouseMoveEvent, NamedKey, RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder,
     WebViewDelegate, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
-    NavigationRequest, OffscreenRenderingContext, PermissionRequest,
+    NavigationRequest, OffscreenRenderingContext, Opts, PermissionRequest, Preferences,
 };
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -105,6 +105,31 @@ struct Engine {
     next_animation: Instant,
 }
 
+fn session_options(session: &SessionDirectory) -> Opts {
+    Opts {
+        config_dir: Some(session.path().to_path_buf()),
+        temporary_storage: true,
+        ignore_certificate_errors: false,
+        ..Opts::default()
+    }
+}
+
+fn restricted_preferences() -> Preferences {
+    Preferences {
+        devtools_server_enabled: false,
+        dom_webrtc_enabled: false,
+        dom_webrtc_transceiver_enabled: false,
+        dom_geolocation_enabled: false,
+        dom_bluetooth_enabled: false,
+        dom_bluetooth_testing_enabled: false,
+        dom_gamepad_enabled: false,
+        dom_webxr_enabled: false,
+        dom_credential_management_enabled: false,
+        dom_async_clipboard_enabled: false,
+        ..Preferences::default()
+    }
+}
+
 fn window_icon() -> Option<Icon> {
     let image = image::load_from_memory(include_bytes!("../../../../assets/lutra.png")).ok()?.into_rgba8();
     let (width, height) = image.dimensions();
@@ -112,7 +137,7 @@ fn window_icon() -> Option<Icon> {
 }
 
 impl Engine {
-    fn start(event_loop: &ActiveEventLoop, waker: Waker, initial: Option<Url>) -> Result<Self, Box<dyn Error>> {
+    fn start(event_loop: &ActiveEventLoop, waker: Waker, initial: Option<Url>, session: &SessionDirectory) -> Result<Self, Box<dyn Error>> {
         let display = event_loop.display_handle()?;
         let window = Rc::new(event_loop.create_window(
             Window::default_attributes()
@@ -134,7 +159,11 @@ impl Engine {
         visuals.panel_fill = egui::Color32::from_rgb(16, 28, 54);
         visuals.selection.bg_fill = egui::Color32::from_rgb(54, 79, 120);
         gui.egui_ctx.set_visuals(visuals);
-        let servo = ServoBuilder::default().event_loop_waker(Box::new(waker)).build();
+        let servo = ServoBuilder::default()
+            .opts(session_options(session))
+            .preferences(restricted_preferences())
+            .event_loop_waker(Box::new(waker))
+            .build();
         servo.setup_logging();
         let delegate = Rc::new(Delegate(window.clone()));
         let mut engine = Self {
@@ -557,6 +586,7 @@ fn translate_key(key: &WinitKey) -> Option<Key> {
 
 
 struct App {
+    session: SessionDirectory,
     initial: Option<(Waker, Option<Url>)>,
     engine: Option<Engine>,
     error: Option<String>,
@@ -565,7 +595,7 @@ struct App {
 impl ApplicationHandler<Wake> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if let Some((waker, url)) = self.initial.take() {
-            match Engine::start(event_loop, waker, url) {
+            match Engine::start(event_loop, waker, url, &self.session) {
                 Ok(engine) => self.engine = Some(engine),
                 Err(error) => {
                     self.error = Some(error.to_string());
@@ -620,14 +650,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::<Wake>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
+        session: SessionDirectory::create()?,
         initial: Some((Waker(event_loop.create_proxy()), initial)),
         engine: None,
         error: None,
     };
-    event_loop.run_app(&mut app)?;
+    let run_result = event_loop.run_app(&mut app);
     drop(app.engine.take());
+    let cleanup_result = app.session.close();
+    run_result?;
     if let Some(error) = app.error {
         return Err(error.into());
     }
+    cleanup_result?;
     Ok(())
 }

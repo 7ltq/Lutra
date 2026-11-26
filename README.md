@@ -14,6 +14,8 @@ The experimental navigation policy rejects non-HTTPS addresses and denies permis
 
 The tabs currently share a Servo engine and rendering context. They are not isolated security boundaries. Site isolation, operating-system sandboxing, storage partitioning, tracking protection and fingerprinting resistance remain unimplemented. Do not use this build as a substitute for a privacy browser.
 
+The experimental browser requests temporary storage from Servo and assigns a new temporary data directory to each run. It attempts to remove that directory when it exits. Files may remain after a crash or failed cleanup. Selected device and communication APIs are disabled through engine preferences. These changes are not a promise of anonymous browsing or secure deletion.
+
 Lutra has no first-party telemetry service. Websites and other components can still communicate over the network.
 
 We have not established the memory or CPU use of the complete browser. We intend to publish measurements, not estimates.
