@@ -17,3 +17,5 @@ Run the same workload with an empty browser, one page, and several pages. Repeat
 The sum of process working sets can count shared pages more than once. Private memory is not the same as physical RAM. Short-lived processes can escape sampling, and PID reuse is a limitation. The script does not measure GPU memory.
 
 The renderer limit is currently a process-count limit, not a memory limit. Automatic suspension is not enabled.
+
+The experimental renderer now uses an offscreen GPU rendering context for the page and composites it into the same window as the navigation controls. This avoids an explicit CPU readback in the composition path. It still allocates GPU resources and has not been benchmarked. The event loop waits when the page is not animating, and uses a timed wake for animation while the window is visible.

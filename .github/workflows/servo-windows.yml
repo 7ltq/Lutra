@@ -1,0 +1,36 @@
+name: Servo on Windows
+on:
+  push:
+    paths:
+      - 'crates/servo-integration/**'
+      - 'crates/browser-core/**'
+      - 'Cargo.toml'
+      - '.github/workflows/servo-windows.yml'
+  pull_request:
+    paths:
+      - 'crates/servo-integration/**'
+      - 'crates/browser-core/**'
+      - 'Cargo.toml'
+      - '.github/workflows/servo-windows.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: servo-windows-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  renderer:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/servo-integration -> target
+      - run: cargo +1.97.1 build --release --manifest-path crates/servo-integration/Cargo.toml --features servo-experimental --bin servo-preview
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lutra-servo-windows
+          path: crates/servo-integration/target/release/servo-preview.exe
+          if-no-files-found: error

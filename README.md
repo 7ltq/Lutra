@@ -8,7 +8,7 @@ The aim is to give people more control over their browsing, without making the b
 
 Lutra is an experimental project, not a browser ready for daily use. Do not rely on it for sensitive browsing.
 
-The interface and the web engine currently run separately. Site isolation, sandboxing, tracking protection, storage partitioning and resistance to browser fingerprinting have not been implemented. The privacy settings in the source code do not yet enforce these protections.
+The original tab interface and the web engine run separately. The experimental renderer now includes its own address bar and navigation controls in the same window as the web page. It has no native tab strip yet. Site isolation, sandboxing, tracking protection, storage partitioning and resistance to browser fingerprinting have not been implemented. The privacy settings in the source code do not yet enforce these protections.
 
 Lutra does not include its own telemetry service. This does not prevent websites, network providers or engine dependencies from communicating over the network. Lutra does not hide your IP address.
 
@@ -22,12 +22,12 @@ Install Rust and the Visual Studio C++ build tools. For the engine, also follow 
 - `test.bat`: run the workspace tests.
 - `build-all.bat`: build the experimental Servo renderer and start the interface.
 
-The experimental renderer targets Servo v0.7.0. The Windows workflow tests the interface on each push. The renderer build is opt-in through the workflow dispatch input. A green interface build does not establish that Servo works.
+The experimental renderer targets Servo v0.7.0. The Windows workflow tests the original interface. A separate workflow builds the renderer when relevant source files change. A successful build does not establish that the program renders correctly.
 
 See [the build results](https://github.com/7ltq/Lutra/actions) for the state of each revision.
 
 ## Development
 
-The next step is to render web pages inside the browser window. After that, we can measure resource use and implement browser protections at the engine boundary.
+The next step is to verify the combined rendering and navigation window on Windows. The renderer denies permission requests and restricts navigation requests to HTTP and HTTPS URLs without credentials. These checks are not a sandbox or comprehensive network protection. Native tabs and site isolation remain open.
 
 Lutra is an independent project. It is not affiliated with Mullvad, the Tor Project or Servo.

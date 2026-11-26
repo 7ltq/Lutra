@@ -3,11 +3,6 @@ on:
   push:
   pull_request:
   workflow_dispatch:
-    inputs:
-      servo:
-        description: Build experimental Servo renderer
-        type: boolean
-        default: false
 permissions:
   contents: read
 concurrency:
@@ -29,18 +24,4 @@ jobs:
         with:
           name: lutra-shell-windows
           path: target/release/browser-ui.exe
-          if-no-files-found: error
-  servo:
-    if: github.event_name == 'workflow_dispatch' && inputs.servo
-    runs-on: windows-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup update stable
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: cargo +1.97.1 build --release --manifest-path crates/servo-integration/Cargo.toml --features servo-experimental --bin servo-preview
-      - uses: actions/upload-artifact@v4
-        with:
-          name: lutra-servo-windows
-          path: crates/servo-integration/target/release/servo-preview.exe
           if-no-files-found: error
