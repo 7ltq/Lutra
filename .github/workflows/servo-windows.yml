@@ -5,32 +5,114 @@ on:
       - 'crates/servo-integration/**'
       - 'crates/browser-core/**'
       - 'Cargo.toml'
+      - 'scripts/build-servo.ps1'
+      - 'scripts/smoke-startup.ps1'
+      - 'scripts/start-lutra-diagnostic.bat'
       - '.github/workflows/servo-windows.yml'
   pull_request:
     paths:
       - 'crates/servo-integration/**'
       - 'crates/browser-core/**'
       - 'Cargo.toml'
+      - 'scripts/build-servo.ps1'
+      - 'scripts/smoke-startup.ps1'
+      - 'scripts/start-lutra-diagnostic.bat'
       - '.github/workflows/servo-windows.yml'
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: servo-windows-${{ github.ref }}
+  group: servo-windows-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 jobs:
   renderer:
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 90
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TARGET_DIR: C:\lt-target
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install 1.97.1 --profile minimal
+        with:
+          persist-credentials: false
+      - name: Enable Git long paths
+        run: git config --global core.longpaths true
+      - name: Install Rust
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Install LLVM
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "20.1.8"
+          directory: ${{ runner.temp }}/llvm
+      - name: Configure libclang
+        run: |
+          "LIBCLANG_PATH=$(Join-Path $env:LLVM_PATH 'bin')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Check C++ toolchain compatibility
+        run: |
+          $clang = Join-Path $env:LIBCLANG_PATH 'clang-cl.exe'
+          & $clang --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $source = Join-Path $env:RUNNER_TEMP 'lutra-toolchain-check.cpp'
+          @'
+          #include <vector>
+          int main() { std::vector<int> values{1, 2}; return values[0]; }
+          '@ | Set-Content -Path $source -Encoding ascii
+          & $clang /nologo /TP /std:c++17 -fsyntax-only $source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/servo-integration -> target
-      - run: cargo +1.97.1 build --release --manifest-path crates/servo-integration/Cargo.toml --features servo-experimental --bin servo-preview
+          prefix-key: lutra-servo-vs2022-llvm20
+          workspaces: crates/servo-integration
+          cache-targets: false
+          cache-directories: C:/lt-target
+          cache-on-failure: true
+      - name: Resolve engine dependencies
+        run: cargo +1.97.1 fetch --manifest-path crates/servo-integration/Cargo.toml
+      - name: Build native browser
+        run: .\scripts\build-servo.ps1 -TargetDirectory $env:CARGO_TARGET_DIR
+      - name: Verify configuration and cleanup
+        run: |
+          & "$env:CARGO_TARGET_DIR\release\servo-preview.exe" --check-config
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package executable and adjacent libraries
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item "$env:CARGO_TARGET_DIR\release\servo-preview.exe" dist\
+          foreach ($name in @('libEGL.dll', 'libGLESv2.dll')) {
+            $dll = Join-Path "$env:CARGO_TARGET_DIR\release" $name
+            if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) {
+              throw "Missing required ANGLE library: $name"
+            }
+            Copy-Item -LiteralPath $dll -Destination dist\
+          }
+          Get-ChildItem "$env:CARGO_TARGET_DIR\release" -Filter '*.dll' -File |
+            Where-Object { $_.Name -notin @('libEGL.dll', 'libGLESv2.dll') } |
+            Copy-Item -Destination dist
+          Copy-Item README.md dist\
+          Copy-Item scripts/start-lutra-diagnostic.bat dist\
+          Copy-Item crates/servo-integration/Cargo.lock dist\
+          Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $([IO.Path]::GetFileName($_.Path))" } | Set-Content dist\SHA256SUMS.txt
+      - name: Test packaged browser startup
+        id: startup
+        run: .\scripts\smoke-startup.ps1 -Executable (Join-Path $PWD 'dist\servo-preview.exe')
       - uses: actions/upload-artifact@v4
         with:
           name: lutra-servo-windows
-          path: crates/servo-integration/target/release/servo-preview.exe
+          path: dist/
           if-no-files-found: error
+      - name: Retain failed startup package for diagnosis
+        if: failure() && steps.startup.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lutra-servo-failed-startup
+          path: dist/
+          if-no-files-found: ignore
+      - name: Upload startup diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lutra-startup-diagnostics
+          path: startup-logs/
+          if-no-files-found: ignore

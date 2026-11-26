@@ -1,17 +1,23 @@
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use browser_core::{native_tabs::{NativeTabs, MAX_TABS}, BrowserState};
+use browser_core::network_policy::NetworkPolicy;
+use browser_core::preferences::{Appearance, BrowserPreferences, SearchProvider};
+use browser_core::{native_tabs::{NativeTabs, MAX_TABS}, session::SessionDirectory, browser_features::{SessionLinks, wheel_lines}, BrowserState};
 use egui_glow::{CallbackFn, EguiGlow};
+#[path = "../page_controls.rs"]
+mod page_controls;
+use page_controls::{ControlOutcome, PageControl};
 use euclid::{Point2D, Rect, Scale, Size2D};
 use servo::{
     Code, DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, Location,
     Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
     MouseMoveEvent, NamedKey, RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder,
     WebViewDelegate, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
-    NavigationRequest, OffscreenRenderingContext, PermissionRequest,
+    NavigationRequest, OffscreenRenderingContext, Opts, PermissionRequest, Preferences,
 };
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -20,7 +26,7 @@ use winit::event::{ElementState, MouseButton as WinitButton, MouseScrollDelta, W
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WinitKey, NamedKey as WinitNamedKey};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use winit::window::{Icon, Window, WindowId};
+use winit::window::{Fullscreen, Icon, Theme, Window, WindowId};
 
 #[derive(Debug)]
 struct Wake;
@@ -38,28 +44,101 @@ impl EventLoopWaker for Waker {
     }
 }
 
-struct Delegate(Rc<Window>);
+const FIXTURE_URL: &str = "https://lutra-smoke.invalid/";
+const FIXTURE_TITLE: &str = "Lutra rendering fixture";
+
+struct ResourceDelegate {
+    policy: Rc<RefCell<NetworkPolicy>>,
+    fixture: bool,
+}
+
+impl ResourceDelegate {
+    fn handle(&self, load: servo::WebResourceLoad) {
+        let url = load.request().url.clone();
+        if self.fixture && url.host_str() == Some("lutra-smoke.invalid") {
+            let mut response = servo::WebResourceResponse::new(url);
+            response.headers.insert("content-type", "text/html; charset=utf-8".parse().expect("static header"));
+            let mut intercepted = load.intercept(response);
+            intercepted.send_body_data(include_bytes!("../smoke-fixture.html").to_vec());
+            intercepted.finish();
+        } else if self.policy.borrow_mut().should_block(&url) || self.fixture {
+            load.intercept(servo::WebResourceResponse::new(url)).cancel();
+        }
+    }
+}
+
+impl servo::ServoDelegate for ResourceDelegate {
+    fn load_web_resource(&self, load: servo::WebResourceLoad) { self.handle(load); }
+}
+
+struct Delegate {
+    window: Rc<Window>,
+    active: Cell<Option<servo::WebViewId>>,
+    control: RefCell<Option<PageControl>>,
+    fullscreen: Cell<Option<bool>>,
+    resources: Rc<ResourceDelegate>,
+}
+
+impl Delegate {
+    fn active_matches(&self, view: &WebView) -> bool {
+        self.active.get() == Some(view.id())
+    }
+}
 
 impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, _: WebView) {
-        self.0.request_redraw();
+        self.window.request_redraw();
     }
 
     fn notify_url_changed(&self, _: WebView, _: Url) {
-        self.0.request_redraw();
+        self.window.request_redraw();
+    }
+
+    fn notify_page_title_changed(&self, _: WebView, _: Option<String>) {
+        self.window.request_redraw();
     }
 
     fn notify_history_changed(&self, _: WebView, _: Vec<Url>, _: usize) {
-        self.0.request_redraw();
+        self.window.request_redraw();
     }
 
     fn notify_load_status_changed(&self, _: WebView, _: servo::LoadStatus) {
-        self.0.request_redraw();
+        self.window.request_redraw();
     }
 
     fn notify_animating_changed(&self, _: WebView, _: bool) {
-        self.0.request_redraw();
+        self.window.request_redraw();
     }
+
+    fn notify_status_text_changed(&self, view: WebView, _: Option<String>) {
+        if self.active_matches(&view) { self.window.request_redraw(); }
+    }
+
+    fn notify_fullscreen_state_changed(&self, view: WebView, fullscreen: bool) {
+        if self.active_matches(&view) {
+            self.fullscreen.set(Some(fullscreen));
+            self.window.request_redraw();
+        }
+    }
+
+    fn show_embedder_control(&self, view: WebView, control: servo::EmbedderControl) {
+        if !self.active_matches(&view) || matches!(&control, servo::EmbedderControl::InputMethod(_)) { return; }
+        let mut pending = self.control.borrow_mut();
+        if pending.is_none() {
+            *pending = Some(PageControl::new(view, control));
+            self.window.request_redraw();
+        }
+    }
+
+    fn hide_embedder_control(&self, view: WebView, id: servo::EmbedderControlId) {
+        let mut pending = self.control.borrow_mut();
+        if pending.as_ref().is_some_and(|control| control.matches(view.id(), id)) {
+            *pending = None;
+            self.window.request_redraw();
+        }
+    }
+
+    fn load_web_resource(&self, _: WebView, load: servo::WebResourceLoad) { self.resources.handle(load); }
 
     fn request_permission(&self, _: WebView, request: PermissionRequest) {
         request.deny();
@@ -82,6 +161,22 @@ enum Action {
     Back,
     Forward,
     Reload,
+    Home,
+    Reopen,
+    Bookmark,
+    RemoveBookmark(Url),
+    ClearHistory,
+    Zoom(f32),
+    ResetZoom,
+    Duplicate(usize),
+    MoveTab(usize, usize),
+    Pin(usize),
+    Fullscreen,
+    AddShortcut,
+    RemoveShortcut(usize),
+    OpenLink(Url),
+    AddDomain,
+    RemoveDomain(usize),
 }
 
 struct Engine {
@@ -103,6 +198,46 @@ struct Engine {
     viewport: egui::Rect,
     viewport_scale: f32,
     next_animation: Instant,
+    first_frame: bool,
+    home_search: String,
+    links: SessionLinks,
+    scroll_speed: f32,
+    show_history: bool,
+    show_bookmarks: bool,
+    show_settings: bool,
+    settings: BrowserPreferences,
+    shortcut_name: String,
+    shortcut_url: String,
+    filter: String,
+    last_title: String,
+    last_dark: Option<bool>,
+    domain_input: String,
+    rendered_fixture: bool,
+}
+
+fn session_options(session: &SessionDirectory) -> Opts {
+    Opts {
+        config_dir: Some(session.path().to_path_buf()),
+        temporary_storage: true,
+        ignore_certificate_errors: false,
+        ..Opts::default()
+    }
+}
+
+fn restricted_preferences() -> Preferences {
+    Preferences {
+        devtools_server_enabled: false,
+        dom_webrtc_enabled: false,
+        dom_webrtc_transceiver_enabled: false,
+        dom_geolocation_enabled: false,
+        dom_bluetooth_enabled: false,
+        dom_bluetooth_testing_enabled: false,
+        dom_gamepad_enabled: false,
+        dom_webxr_enabled: false,
+        dom_credential_management_enabled: false,
+        dom_async_clipboard_enabled: false,
+        ..Preferences::default()
+    }
 }
 
 fn window_icon() -> Option<Icon> {
@@ -112,31 +247,44 @@ fn window_icon() -> Option<Icon> {
 }
 
 impl Engine {
-    fn start(event_loop: &ActiveEventLoop, waker: Waker, initial: Option<Url>) -> Result<Self, Box<dyn Error>> {
+    fn start(event_loop: &ActiveEventLoop, waker: Waker, initial: Option<Url>, session: &SessionDirectory, smoke_render: bool) -> Result<Self, Box<dyn Error>> {
+        eprintln!("[Lutra] Initializing Servo");
+        let servo = ServoBuilder::default()
+            .opts(session_options(session))
+            .preferences(restricted_preferences())
+            .event_loop_waker(Box::new(waker))
+            .build();
+        servo.setup_logging();
+        let resources = Rc::new(ResourceDelegate { policy: Rc::new(RefCell::new(NetworkPolicy::default())), fixture: smoke_render });
+        servo.set_delegate(resources.clone());
+        eprintln!("[Lutra] Servo initialized; creating window");
         let display = event_loop.display_handle()?;
         let window = Rc::new(event_loop.create_window(
             Window::default_attributes()
-                .with_title("Lutra — experimental browser")
+                .with_title("Lutra")
+                .with_visible(false)
                 .with_window_icon(window_icon())
                 .with_inner_size(LogicalSize::new(1180.0, 760.0))
                 .with_min_inner_size(LogicalSize::new(640.0, 420.0)),
         )?);
         let handle = window.window_handle()?;
+        eprintln!("[Lutra] Creating graphics context");
         let parent = Rc::new(
             WindowRenderingContext::new(display, handle, window.inner_size())
                 .map_err(|error| format!("Rendering context: {error:?}"))?,
         );
         parent.make_current().map_err(|error| format!("Graphics context: {error:?}"))?;
+        eprintln!("[Lutra] Creating offscreen framebuffer");
         let context = Rc::new(parent.offscreen_context(window.inner_size()));
         context.make_current().map_err(|error| format!("Offscreen context: {error:?}"))?;
+        eprintln!("[Lutra] Initializing interface painter");
         let gui = EguiGlow::new(event_loop, context.glow_gl_api(), None, None, false);
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(16, 28, 54);
-        visuals.selection.bg_fill = egui::Color32::from_rgb(54, 79, 120);
+        visuals.panel_fill = egui::Color32::from_rgb(24, 25, 29);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(56, 87, 127);
         gui.egui_ctx.set_visuals(visuals);
-        let servo = ServoBuilder::default().event_loop_waker(Box::new(waker)).build();
-        servo.setup_logging();
-        let delegate = Rc::new(Delegate(window.clone()));
+
+        let delegate = Rc::new(Delegate { window: window.clone(), active: Cell::new(None), control: RefCell::new(None), fullscreen: Cell::new(None), resources });
         let mut engine = Self {
             tabs: NativeTabs::default(),
             servo,
@@ -156,10 +304,27 @@ impl Engine {
             viewport: egui::Rect::NOTHING,
             viewport_scale: 1.0,
             next_animation: Instant::now(),
+            first_frame: false,
+            home_search: String::new(),
+            links: SessionLinks::default(),
+            scroll_speed: 1.0,
+            show_history: false,
+            show_bookmarks: false,
+            show_settings: false,
+            settings: BrowserPreferences::default(),
+            shortcut_name: String::new(),
+            shortcut_url: String::new(),
+            filter: String::new(),
+            last_title: String::new(),
+            last_dark: None,
+            domain_input: String::new(),
+            rendered_fixture: false,
         };
         if let Some(url) = initial {
             engine.apply(Action::Navigate(url));
         }
+        engine.window.set_visible(true);
+        eprintln!("[Lutra] Window initialized");
         engine.window.request_redraw();
         Ok(engine)
     }
@@ -178,6 +343,9 @@ impl Engine {
     }
 
     fn switch<F: FnOnce(&mut NativeTabs<WebView>) -> bool>(&mut self, change: F) {
+        self.delegate.control.borrow_mut().take();
+        self.delegate.active.set(None);
+        self.delegate.fullscreen.set(None);
         if let Some(view) = self.tabs.active() {
             view.set_focused(false);
             view.hide();
@@ -187,11 +355,13 @@ impl Engine {
             view.show();
             view.set_focused(false);
         }
+        self.delegate.active.set(self.tabs.active().map(WebView::id));
         self.page_focus = false;
         self.cursor = None;
         self.address = self.tabs.active().and_then(WebView::url).map(|url| url.to_string()).unwrap_or_default();
         self.address_dirty = false;
         self.focus_address = self.tabs.active().is_none();
+        self.home_search.clear();
         if changed {
             self.status.clear();
         }
@@ -199,8 +369,81 @@ impl Engine {
 
     fn apply(&mut self, action: Action) {
         match action {
+            Action::AddDomain => {
+                match self.delegate.resources.policy.borrow_mut().add_domain(&self.domain_input) {
+                    Ok(()) => { self.domain_input.clear(); self.status.clear(); }
+                    Err(error) => self.status = error.to_owned(),
+                }
+            }
+            Action::RemoveDomain(index) => { self.delegate.resources.policy.borrow_mut().remove_domain(index); }
+            Action::OpenLink(url) => {
+                if self.tabs.slots().len() < self.settings.max_tabs && servo_integration::ServoAdapter::accepts(&url) {
+                    self.apply(Action::NewTab);
+                    self.apply(Action::Navigate(url));
+                } else { self.status = "Cannot open link: unsupported address or tab limit.".into(); }
+            }
+            Action::Duplicate(index) => {
+                if self.tabs.slots().len() < self.settings.max_tabs {
+                    let url = self.tabs.slots().get(index).and_then(Option::as_ref).and_then(WebView::url);
+                    self.apply(Action::NewTab);
+                    if let Some(url) = url { self.apply(Action::Navigate(url)); }
+                }
+            }
+            Action::MoveTab(from, to) => { self.tabs.move_tab(from, to); }
+            Action::Pin(index) => { self.tabs.toggle_pin(index); }
+            Action::Fullscreen => {
+                if self.window.fullscreen().is_some() {
+                    self.window.set_fullscreen(None);
+                    if let Some(view) = self.tabs.active() { view.exit_fullscreen(); }
+                } else {
+                    self.window.set_fullscreen(Some(Fullscreen::Borderless(self.window.current_monitor())));
+                }
+                self.cursor = None;
+            }
+            Action::AddShortcut => {
+                match self.settings.add_shortcut(&self.shortcut_name, &self.shortcut_url) {
+                    Ok(()) => { self.shortcut_name.clear(); self.shortcut_url.clear(); self.status.clear(); }
+                    Err(error) => self.status = error.to_owned(),
+                }
+            }
+            Action::RemoveShortcut(index) => {
+                if index < self.settings.shortcuts.len() { self.settings.shortcuts.remove(index); }
+            }
+            Action::Home => {
+                if self.tabs.active().is_some() {
+                    self.apply(Action::NewTab);
+                } else {
+                    self.focus_address = true;
+                }
+            }
+            Action::Reopen => {
+                if self.tabs.slots().len() < self.settings.max_tabs {
+                    if let Some(url) = self.links.reopen() {
+                        self.apply(Action::NewTab);
+                        self.apply(Action::Navigate(url));
+                    }
+                }
+            }
+            Action::Bookmark => {
+                if let Some(url) = self.tabs.active().and_then(WebView::url) {
+                    self.links.toggle_bookmark(url);
+                }
+            }
+            Action::RemoveBookmark(url) => { self.links.remove_bookmark(&url); }
+            Action::ClearHistory => {
+                self.links.clear_history();
+                for view in self.tabs.slots().iter().flatten() { view.clear_session_history(); }
+            }
+            Action::Zoom(factor) => {
+                if let Some(view) = self.tabs.active() {
+                    view.set_page_zoom((view.page_zoom() * factor).clamp(0.5, 3.0));
+                }
+            }
+            Action::ResetZoom => {
+                if let Some(view) = self.tabs.active() { view.set_page_zoom(1.0); }
+            }
             Action::NewTab => {
-                if self.tabs.slots().len() >= MAX_TABS {
+                if self.tabs.slots().len() >= self.settings.max_tabs {
                     self.status = "Tab limit reached.".into();
                 } else {
                     self.switch(|tabs| tabs.open());
@@ -212,6 +455,10 @@ impl Engine {
                 }
             }
             Action::Close(index) => {
+                if self.tabs.is_pinned(index) { self.status = "Unpin this tab before closing it.".into(); return; }
+                if let Some(url) = self.tabs.slots().get(index).and_then(Option::as_ref).and_then(WebView::url) {
+                    self.links.record_closed(url);
+                }
                 if index == self.tabs.active_index() {
                     self.switch(|tabs| tabs.close(index));
                 } else {
@@ -223,10 +470,14 @@ impl Engine {
                     self.status = "Only HTTPS websites are supported.".into();
                     return;
                 }
+                self.delegate.control.borrow_mut().take();
                 self.address = url.to_string();
                 self.address_dirty = false;
                 self.status.clear();
-                self.focus_page(false);
+                self.gui.egui_ctx.memory_mut(|memory| {
+                    if let Some(id) = memory.focused() { memory.surrender_focus(id); }
+                });
+                self.focus_page(true);
                 if let Some(view) = self.tabs.active() {
                     view.load(url);
                 } else {
@@ -236,7 +487,7 @@ impl Engine {
                         .delegate(self.delegate.clone())
                         .build();
                     view.show();
-                    view.set_focused(false);
+                    view.set_focused(self.window_focus);
                     let _ = self.tabs.insert_active(view);
                 }
             }
@@ -262,19 +513,39 @@ impl Engine {
                 }
             }
         }
+        self.delegate.active.set(self.tabs.active().map(WebView::id));
         self.window.request_redraw();
     }
 
     fn draw(&mut self) {
+        if let Some(fullscreen) = self.delegate.fullscreen.take() {
+            self.window.set_fullscreen(if fullscreen { Some(Fullscreen::Borderless(self.window.current_monitor())) } else { None });
+        }
+        if self.delegate.control.borrow().is_some() { self.focus_page(false); }
         let size = self.window.inner_size();
         if size.width == 0 || size.height == 0 || self.context.make_current().is_err() {
             return;
         }
 
+        if let Some(url) = self.tabs.active().and_then(WebView::url) {
+            self.links.record_visit(url);
+        }
+        let dark = match self.settings.appearance {
+            Appearance::Light => false,
+            Appearance::Dark => true,
+            Appearance::System => self.window.theme() != Some(Theme::Light),
+        };
+        if self.last_dark != Some(dark) {
+            let mut visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+            visuals.panel_fill = if dark { egui::Color32::from_rgb(24, 25, 29) } else { egui::Color32::from_rgb(248, 249, 251) };
+            self.gui.egui_ctx.set_visuals(visuals);
+            self.last_dark = Some(dark);
+        }
         let mut action = None;
         let Self { tabs, gui, context, parent, window, address, address_dirty, focus_address,
-            status, viewport, viewport_scale, .. } = self;
+            status, viewport, viewport_scale, links, home_search, scroll_speed, show_history, show_bookmarks, show_settings, settings, shortcut_name, shortcut_url, filter, last_title, delegate, domain_input, .. } = self;
         let view = tabs.active();
+        let fixture_ready = delegate.resources.fixture && view.is_some_and(|view| matches!(view.load_status(), servo::LoadStatus::Complete) && view.page_title().as_deref() == Some(FIXTURE_TITLE));
 
         if !*address_dirty {
             if let Some(url) = view.and_then(WebView::url) {
@@ -284,26 +555,41 @@ impl Engine {
             }
         }
 
+        let caption = view.and_then(WebView::page_title).filter(|title| !title.is_empty()).unwrap_or_else(|| "New tab".into());
+        let caption = format!("{} — Lutra", caption.chars().take(160).collect::<String>());
+        if *last_title != caption { window.set_title(&caption); *last_title = caption; }
+        let mut control_outcome = ControlOutcome::Pending;
+        let mut pending = delegate.control.borrow_mut().take();
         gui.run(window, |ui| {
+            if window.fullscreen().is_none() {
             egui::Panel::top("tabs")
-                .frame(egui::Frame::new().fill(egui::Color32::from_rgb(12, 23, 46)).inner_margin(6))
+                .frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(6))
                 .show_inside(ui, |ui| {
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(tabs.slots().len() < MAX_TABS, egui::Button::new("+")).clicked() {
+                        if ui.add_enabled(tabs.slots().len() < settings.max_tabs, egui::Button::new("+")).clicked() {
                             action = Some(Action::NewTab);
                         }
                         egui::ScrollArea::horizontal().id_salt("tab_strip").show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 for (index, slot) in tabs.slots().iter().enumerate() {
                                     let url = slot.as_ref().and_then(WebView::url);
-                                    let title = url.as_ref().and_then(Url::host_str).unwrap_or("New tab");
-                                    let text: String = title.chars().take(28).collect();
-                                    if ui.selectable_label(index == tabs.active_index(), text).clicked() {
-                                        action = Some(Action::Select(index));
+                                    let title = slot.as_ref().and_then(WebView::page_title).filter(|title| !title.is_empty()).unwrap_or_else(|| url.as_ref().and_then(Url::host_str).unwrap_or("New tab").to_owned());
+                                    let mut text: String = title.chars().take(28).collect();
+                                    if tabs.is_pinned(index) { text = format!("● {text}"); }
+                                    if slot.as_ref().is_some_and(|view| !matches!(view.load_status(), servo::LoadStatus::Complete)) {
+                                        text = format!("… {text}");
                                     }
-                                    if ui.small_button("×").clicked() {
-                                        action = Some(Action::Close(index));
-                                    }
+                                    let response = ui.selectable_label(index == tabs.active_index(), text).on_hover_text(title);
+                                    if response.clicked() { action = Some(Action::Select(index)); }
+                                    if response.middle_clicked() && !tabs.is_pinned(index) { action = Some(Action::Close(index)); }
+                                    response.context_menu(|ui| {
+                                        if ui.button(if tabs.is_pinned(index) { "Unpin tab" } else { "Pin tab" }).clicked() { action = Some(Action::Pin(index)); ui.close(); }
+                                        if ui.add_enabled(tabs.slots().len() < settings.max_tabs, egui::Button::new("Duplicate tab")).clicked() { action = Some(Action::Duplicate(index)); ui.close(); }
+                                        if ui.add_enabled(index > 0, egui::Button::new("Move left")).clicked() { action = Some(Action::MoveTab(index, index - 1)); ui.close(); }
+                                        if ui.add_enabled(index + 1 < tabs.slots().len(), egui::Button::new("Move right")).clicked() { action = Some(Action::MoveTab(index, index + 1)); ui.close(); }
+                                        if ui.add_enabled(!tabs.is_pinned(index), egui::Button::new("Close tab")).clicked() { action = Some(Action::Close(index)); ui.close(); }
+                                    });
+                                    if !tabs.is_pinned(index) && ui.small_button("×").clicked() { action = Some(Action::Close(index)); }
                                 }
                             });
                         });
@@ -311,10 +597,10 @@ impl Engine {
                 });
 
             egui::Panel::top("browser_controls")
-                .frame(egui::Frame::new().fill(egui::Color32::from_rgb(16, 28, 54)).inner_margin(8))
+                .frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(8))
                 .show_inside(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Lutra").strong().color(egui::Color32::from_rgb(255, 197, 64)));
+                        if ui.button("⌂").on_hover_text("Home").clicked() { action = Some(Action::Home); }
                         if ui.add_enabled(view.is_some_and(WebView::can_go_back), egui::Button::new("‹")).clicked() {
                             action = Some(Action::Back);
                         }
@@ -324,7 +610,7 @@ impl Engine {
                         if ui.add_enabled(view.is_some(), egui::Button::new("Reload")).clicked() {
                             action = Some(Action::Reload);
                         }
-                        let width = (ui.available_width() - 56.0).max(80.0);
+                        let width = (ui.available_width() - 114.0).max(80.0);
                         let field = ui.add_sized([width, 29.0], egui::TextEdit::singleline(&mut *address).hint_text("Search or enter an address"));
                         if field.changed() {
                             *address_dirty = true;
@@ -335,8 +621,11 @@ impl Engine {
                         }
                         let enter = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
                         let go = ui.button("Go").clicked();
+                        let bookmarked = view.and_then(WebView::url).is_some_and(|url| links.bookmarks().contains(&url));
+                        if ui.add_enabled(view.is_some(), egui::Button::new(if bookmarked { "★" } else { "☆" })).on_hover_text("Bookmark (session only)").clicked() { action = Some(Action::Bookmark); }
+                        if ui.button("⋯").on_hover_text("Browser settings").clicked() { *show_settings = !*show_settings; }
                         if enter || go {
-                            match BrowserState::parse_address(address) {
+                            match BrowserState::parse_address_with(address, settings.search) {
                                 Ok(url) => action = Some(Action::Navigate(url)),
                                 Err(error) => *status = error.to_owned(),
                             }
@@ -344,12 +633,98 @@ impl Engine {
                     });
                     let origin = view.and_then(WebView::url).filter(servo_integration::ServoAdapter::accepts)
                         .map(|url| url.origin().ascii_serialization());
-                    ui.label(egui::RichText::new(origin.as_deref().unwrap_or("No page loaded")).small());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(origin.as_deref().unwrap_or("Private new tab")).small());
+                        if view.is_some_and(|view| !matches!(view.load_status(), servo::LoadStatus::Complete)) { ui.spinner(); ui.label("Loading"); }
+                        if let Some(view) = view {
+                            if ui.small_button("−").clicked() { action = Some(Action::Zoom(1.0 / 1.1)); }
+                            if ui.small_button(format!("{:.0}%", view.page_zoom() * 100.0)).on_hover_text("Reset zoom").clicked() { action = Some(Action::ResetZoom); }
+                            if ui.small_button("+").clicked() { action = Some(Action::Zoom(1.1)); }
+                        }
+                        if ui.small_button("Bookmarks").clicked() { *show_bookmarks = !*show_bookmarks; }
+                        if ui.small_button("History").clicked() { *show_history = !*show_history; }
+                        if ui.small_button("Fullscreen").clicked() { action = Some(Action::Fullscreen); }
+                    });
                     if !status.is_empty() {
                         ui.label(status.as_str());
                     }
                 });
 
+            if *show_settings || *show_history || *show_bookmarks {
+                egui::Panel::right("browser_sidebar").show_inside(ui, |ui| {
+                    if *show_settings {
+                        ui.heading("Settings");
+                        ui.label("Appearance");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut settings.appearance, Appearance::System, "System");
+                            ui.selectable_value(&mut settings.appearance, Appearance::Light, "Light");
+                            ui.selectable_value(&mut settings.appearance, Appearance::Dark, "Dark");
+                        });
+                        ui.label("Search engine");
+                        for provider in SearchProvider::ALL { ui.radio_value(&mut settings.search, provider, provider.label()); }
+                        ui.add(egui::Slider::new(&mut settings.max_tabs, tabs.slots().len().max(1)..=MAX_TABS).text("Tab limit"));
+                        ui.separator();
+                        ui.label("Home shortcuts");
+                        ui.text_edit_singleline(shortcut_name).on_hover_text("Shortcut name");
+                        ui.text_edit_singleline(shortcut_url).on_hover_text("Full HTTPS URL");
+                        if ui.button("Add shortcut").clicked() { action = Some(Action::AddShortcut); }
+                        for (index, shortcut) in settings.shortcuts.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(&shortcut.label);
+                                if ui.small_button("×").clicked() { action = Some(Action::RemoveShortcut(index)); }
+                            });
+                        }
+                        ui.separator();
+                        ui.add(egui::Slider::new(scroll_speed, 0.5..=3.0).text("Scroll speed"));
+                        if ui.button("Reset scroll speed").clicked() { *scroll_speed = 1.0; }
+                        ui.separator();
+                        ui.heading("Privacy");
+                        {
+                            let mut policy = delegate.resources.policy.borrow_mut();
+                            ui.label("HTTP resource requests blocked when handled by Servo callbacks.");
+                            ui.checkbox(&mut policy.block_known_domains, "Block starter tracker domains");
+                            ui.label(format!("Blocked requests: {}", policy.blocked_count()));
+                            ui.add(egui::TextEdit::singleline(domain_input).hint_text("tracker.example.com"));
+                            if ui.button("Block domain").clicked() { action = Some(Action::AddDomain); }
+                            for (index, domain) in policy.custom_domains().iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.label(domain);
+                                    if ui.small_button("×").clicked() { action = Some(Action::RemoveDomain(index)); }
+                                });
+                            }
+                            ui.label("Domain filtering is not a comprehensive ad blocker.");
+                        }
+                        ui.label("Settings and browsing data are session-only.");
+                        if ui.button("Close settings").clicked() { *show_settings = false; }
+                    }
+                    if *show_bookmarks {
+                        ui.heading("Bookmarks");
+                        egui::ScrollArea::vertical().id_salt("bookmarks").max_height(220.0).show(ui, |ui| {
+                            for url in links.bookmarks().iter().rev() {
+                                ui.horizontal(|ui| {
+                                    if ui.button(url.host_str().unwrap_or("Website")).on_hover_text(url.as_str()).clicked() { action = Some(Action::Navigate(url.clone())); }
+                                    if ui.small_button("×").clicked() { action = Some(Action::RemoveBookmark(url.clone())); }
+                                });
+                            }
+                        });
+                        if links.bookmarks().is_empty() { ui.label("No bookmarks in this session."); }
+                        if ui.button("Close bookmarks").clicked() { *show_bookmarks = false; }
+                    }
+                    if *show_history {
+                        ui.heading("Session history");
+                        ui.add(egui::TextEdit::singleline(filter).hint_text("Search history"));
+                        if ui.button("Clear list").clicked() { action = Some(Action::ClearHistory); }
+                        if ui.button("Reopen closed tab").clicked() { action = Some(Action::Reopen); }
+                        egui::ScrollArea::vertical().id_salt("history").max_height(240.0).show(ui, |ui| {
+                            for url in links.history().iter().rev().filter(|url| url.as_str().to_lowercase().contains(&filter.to_lowercase())) {
+                                if ui.button(url.host_str().unwrap_or("Website")).on_hover_text(url.as_str()).clicked() { action = Some(Action::Navigate(url.clone())); }
+                            }
+                        });
+                        if ui.button("Close history").clicked() { *show_history = false; }
+                    }
+                });
+            }
+            }
             let rect = ui.available_rect_before_wrap();
             let scale = ui.ctx().pixels_per_point();
             *viewport = rect;
@@ -379,19 +754,46 @@ impl Engine {
             } else {
                 ui.vertical_centered(|ui| {
                     ui.add_space((rect.height() * 0.2).max(0.0));
-                    ui.label(egui::RichText::new("Lutra").size(42.0).color(egui::Color32::from_rgb(255, 197, 64)));
-                    ui.label("A browser in development.");
-                    ui.label("No page is opened until you enter an address.");
-                    ui.add_space(8.0);
-                    ui.label("Do not rely on this build for sensitive browsing.");
+                    ui.label(egui::RichText::new("Lutra").size(54.0).strong());
+                    ui.label(egui::RichText::new("A quieter way to browse").size(16.0).color(egui::Color32::GRAY));
+                    ui.add_space(22.0);
+                    let search = ui.add_sized([(rect.width() * 0.65).clamp(160.0, 560.0), 40.0], egui::TextEdit::singleline(home_search).hint_text("Search the web or enter a URL"));
+                    if (search.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))) || ui.button("Search").clicked() {
+                        match BrowserState::parse_address_with(home_search, settings.search) {
+                            Ok(url) => { action = Some(Action::Navigate(url)); home_search.clear(); }
+                            Err(error) => *status = error.to_owned(),
+                        }
+                    }
+                    ui.add_space(20.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for shortcut in &settings.shortcuts {
+                            if ui.button(&shortcut.label).on_hover_text(shortcut.url.as_str()).clicked() { action = Some(Action::Navigate(shortcut.url.clone())); }
+                        }
+                    });
+                    ui.add_space(28.0);
+                    ui.label("Private session · no persistent browsing history");
+                    ui.label(egui::RichText::new("Experimental engine — not for sensitive browsing").small().color(egui::Color32::GRAY));
                 });
             }
+            if let Some(control) = pending.as_mut() {
+                control_outcome = control.draw(ui.ctx());
+            }
         });
+        match control_outcome {
+            ControlOutcome::Pending => { if let Some(control) = pending.take() { *delegate.control.borrow_mut() = Some(control); } }
+            ControlOutcome::Done => { pending.take(); }
+            ControlOutcome::OpenLink(url) => { pending.take(); action = Some(Action::OpenLink(url)); }
+        }
 
         if context.make_current().is_ok() {
             parent.prepare_for_rendering();
             gui.paint(window);
             parent.present();
+            if fixture_ready { self.rendered_fixture = true; }
+            if !self.first_frame {
+                self.first_frame = true;
+                eprintln!("[Lutra] First interface frame submitted");
+            }
         }
         if gui.egui_ctx.has_requested_repaint() {
             window.request_redraw();
@@ -402,6 +804,8 @@ impl Engine {
     }
 
     fn handle(&mut self, event: WindowEvent) {
+        let control_open = self.delegate.control.borrow().is_some();
+        let page_pointer = !control_open && self.tabs.active().is_some() && self.cursor.is_some();
         let response = self.gui.on_window_event(&self.window, &event);
         if response.repaint && !matches!(&event, WindowEvent::RedrawRequested) {
             self.window.request_redraw();
@@ -409,7 +813,9 @@ impl Engine {
         match event {
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::Resized(size) if size.width != 0 && size.height != 0 => {
-                self.parent.resize(size);
+                if self.parent.size() != size {
+                    self.parent.resize(size);
+                }
                 self.cursor = None;
                 self.window.request_redraw();
             }
@@ -421,6 +827,7 @@ impl Engine {
                 self.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
+                if control_open { self.cursor = None; return; }
                 let logical = egui::pos2(position.x as f32 / self.viewport_scale, position.y as f32 / self.viewport_scale);
                 if self.viewport.contains(logical) {
                     let relative = logical - self.viewport.min;
@@ -437,9 +844,9 @@ impl Engine {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if state == ElementState::Pressed {
-                    self.focus_page(self.cursor.is_some() && self.tabs.active().is_some() && !response.consumed);
+                    self.focus_page(page_pointer);
                 }
-                if !response.consumed {
+                if page_pointer {
                     if let Some(point) = self.cursor {
                         let button = match button {
                             WinitButton::Left => MouseButton::Primary,
@@ -457,13 +864,21 @@ impl Engine {
                     }
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } if !response.consumed => {
+            WindowEvent::MouseWheel { delta, .. } if page_pointer => {
                 if let Some(point) = self.cursor {
                     let (x, y, mode) = match delta {
-                        MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y), WheelMode::DeltaLine),
+                        MouseScrollDelta::LineDelta(x, y) => {
+                            let (x, y) = wheel_lines(x, y, self.scroll_speed);
+                            (x, y, WheelMode::DeltaLine)
+                        }
                         MouseScrollDelta::PixelDelta(p) => (p.x, p.y, WheelMode::DeltaPixel),
                     };
-                    self.input(InputEvent::Wheel(WheelEvent::new(WheelDelta { x, y, z: 0.0, mode }, point.into())));
+                    if self.modifiers.contains(Modifiers::CONTROL) && y != 0.0 {
+                        self.apply(Action::Zoom(if y > 0.0 { 1.1 } else { 1.0 / 1.1 }));
+                    } else {
+                        self.input(InputEvent::Wheel(WheelEvent::new(WheelDelta { x, y, z: 0.0, mode }, point.into())));
+                        self.window.request_redraw();
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(value) => {
@@ -474,6 +889,7 @@ impl Engine {
                 self.modifiers.set(Modifiers::ALT, state.alt_key());
                 self.modifiers.set(Modifiers::META, state.super_key());
             }
+            WindowEvent::ThemeChanged(_) => { self.window.request_redraw(); }
             WindowEvent::Focused(focused) => {
                 self.window_focus = focused;
                 if !focused {
@@ -482,10 +898,35 @@ impl Engine {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if control_open { self.window.request_redraw(); return; }
+                if event.state == ElementState::Pressed && !event.repeat {
+                    let shortcut = match &event.logical_key {
+                        WinitKey::Named(WinitNamedKey::F5) => Some(Action::Reload),
+                        WinitKey::Named(WinitNamedKey::F11) => Some(Action::Fullscreen),
+                        WinitKey::Named(WinitNamedKey::Escape) if self.window.fullscreen().is_some() => Some(Action::Fullscreen),
+                        WinitKey::Named(WinitNamedKey::ArrowLeft) if self.modifiers.contains(Modifiers::ALT) => Some(Action::Back),
+                        WinitKey::Named(WinitNamedKey::ArrowRight) if self.modifiers.contains(Modifiers::ALT) => Some(Action::Forward),
+                        WinitKey::Named(WinitNamedKey::Home) if self.modifiers.contains(Modifiers::ALT) => Some(Action::Home),
+                        WinitKey::Named(WinitNamedKey::Tab) if self.modifiers.contains(Modifiers::CONTROL) => {
+                            let len = self.tabs.slots().len();
+                            let offset = if self.modifiers.contains(Modifiers::SHIFT) { len - 1 } else { 1 };
+                            Some(Action::Select((self.tabs.active_index() + offset) % len))
+                        }
+                        _ => None,
+                    };
+                    if let Some(action) = shortcut { self.apply(action); return; }
+                }
                 if self.modifiers.contains(Modifiers::CONTROL) {
                     if let WinitKey::Character(key) = &event.logical_key {
                         let shortcut = match key.to_ascii_lowercase().as_str() {
+                            "t" if self.modifiers.contains(Modifiers::SHIFT) => Some(Action::Reopen),
                             "t" => Some(Action::NewTab),
+                            "r" => Some(Action::Reload),
+                            "d" => Some(Action::Bookmark),
+                            "h" => { if event.state == ElementState::Pressed && !event.repeat { self.show_history = !self.show_history; self.focus_page(false); self.window.request_redraw(); } return; },
+                            "+" | "=" => Some(Action::Zoom(1.1)),
+                            "-" => Some(Action::Zoom(1.0 / 1.1)),
+                            "0" => Some(Action::ResetZoom),
                             "w" => Some(Action::Close(self.tabs.active_index())),
                             "l" => {
                                 if event.state == ElementState::Pressed {
@@ -505,7 +946,7 @@ impl Engine {
                         }
                     }
                 }
-                if self.page_focus && self.window_focus && !response.consumed {
+                if self.page_focus && self.window_focus {
                     if let Some(key) = translate_key(&event.logical_key) {
                         let state = match event.state {
                             ElementState::Pressed => KeyState::Down,
@@ -525,6 +966,8 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         if self.context.make_current().is_ok() {
+            self.tabs = NativeTabs::default();
+            self.servo.spin_event_loop();
             self.gui.destroy();
         }
     }
@@ -557,15 +1000,19 @@ fn translate_key(key: &WinitKey) -> Option<Key> {
 
 
 struct App {
+    session: SessionDirectory,
     initial: Option<(Waker, Option<Url>)>,
     engine: Option<Engine>,
     error: Option<String>,
+    smoke: bool,
+    smoke_render: bool,
+    smoke_exit_at: Option<Instant>,
 }
 
 impl ApplicationHandler<Wake> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if let Some((waker, url)) = self.initial.take() {
-            match Engine::start(event_loop, waker, url) {
+            match Engine::start(event_loop, waker, url, &self.session, self.smoke_render) {
                 Ok(engine) => self.engine = Some(engine),
                 Err(error) => {
                     self.error = Some(error.to_string());
@@ -583,6 +1030,22 @@ impl ApplicationHandler<Wake> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(engine) = &mut self.engine else { return };
+        if self.smoke {
+            if engine.first_frame && (!self.smoke_render || engine.rendered_fixture) {
+                let deadline = *self.smoke_exit_at.get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
+                if Instant::now() >= deadline {
+                    if self.smoke_render { eprintln!("[Lutra] Rendering fixture check passed"); }
+                    else { eprintln!("[Lutra] Startup smoke check passed"); }
+                    event_loop.exit();
+                    return;
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(100)));
+                engine.window.request_redraw();
+            }
+            return;
+        }
         if !engine.tabs.active().is_some_and(WebView::animating) || engine.window.is_minimized() == Some(true) {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
@@ -609,25 +1072,81 @@ impl ApplicationHandler<Wake> for App {
     }
 }
 
+fn check_config() -> Result<(), Box<dyn Error>> {
+    let session = SessionDirectory::create()?;
+    let path = session.path().to_path_buf();
+    let opts = session_options(&session);
+    let prefs = restricted_preferences();
+    if !opts.temporary_storage || opts.ignore_certificate_errors
+        || opts.config_dir.as_deref() != Some(path.as_path())
+        || prefs.devtools_server_enabled || prefs.dom_webrtc_enabled
+        || prefs.dom_webrtc_transceiver_enabled || prefs.dom_geolocation_enabled
+        || prefs.dom_bluetooth_enabled || prefs.dom_bluetooth_testing_enabled
+        || prefs.dom_gamepad_enabled || prefs.dom_webxr_enabled
+        || prefs.dom_credential_management_enabled || prefs.dom_async_clipboard_enabled
+    {
+        return Err("Unexpected engine configuration".into());
+    }
+    session.close()?;
+    if path.exists() {
+        return Err("Session directory was not removed".into());
+    }
+    println!("Configuration and session cleanup checks passed.");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn check_graphics_files() -> Result<(), Box<dyn Error>> {
+    let executable = std::env::current_exe()?;
+    let directory = executable.parent().ok_or("Executable directory unavailable")?;
+    for name in ["libEGL.dll", "libGLESv2.dll"] {
+        if !directory.join(name).is_file() {
+            return Err(format!("Required graphics library is missing: {name}. Extract the complete Lutra package.").into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn check_graphics_files() -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| "Could not initialize TLS")?;
-    let initial = std::env::args().nth(1).map(|input| Url::parse(&input)).transpose()?;
+    let argument = std::env::args().nth(1);
+    if argument.as_deref() == Some("--check-config") {
+        return check_config();
+    }
+    check_graphics_files()?;
+    let smoke_render = argument.as_deref() == Some("--smoke-render");
+    let smoke = smoke_render || argument.as_deref() == Some("--smoke-startup");
+    let initial = if smoke_render { Some(Url::parse(FIXTURE_URL)?) } else if smoke { None } else { argument.map(|input| Url::parse(&input)).transpose()? };
     if initial.as_ref().is_some_and(|url| !servo_integration::ServoAdapter::accepts(url)) {
         return Err("Only HTTPS websites without credentials are supported".into());
     }
     let event_loop = EventLoop::<Wake>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
+        session: SessionDirectory::create()?,
         initial: Some((Waker(event_loop.create_proxy()), initial)),
         engine: None,
         error: None,
+        smoke,
+        smoke_render,
+        smoke_exit_at: None,
     };
-    event_loop.run_app(&mut app)?;
+    let run_result = event_loop.run_app(&mut app);
+    let smoke_ok = !smoke || app.smoke_exit_at.is_some_and(|deadline| Instant::now() >= deadline);
     drop(app.engine.take());
+    let cleanup_result = app.session.close();
+    run_result?;
     if let Some(error) = app.error {
         return Err(error.into());
     }
+    cleanup_result?;
+    if !smoke_ok { return Err("Startup smoke check ended before first frame".into()); }
     Ok(())
 }

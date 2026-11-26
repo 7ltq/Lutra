@@ -1,6 +1,10 @@
 use url::Url;
 
 pub mod native_tabs;
+pub mod browser_features;
+pub mod preferences;
+pub mod network_policy;
+pub mod session;
 
 #[derive(Clone, Debug)]
 pub struct Tab {
@@ -46,15 +50,20 @@ impl BrowserState {
     }
 
     pub fn parse_address(input: &str) -> Result<Url, &'static str> {
+        Self::parse_address_with(input, preferences::SearchProvider::DuckDuckGo)
+    }
+
+    pub fn parse_address_with(input: &str, provider: preferences::SearchProvider) -> Result<Url, &'static str> {
+        if input.len() > 8192 || input.chars().any(char::is_control) {
+            return Err("Invalid address");
+        }
         let value = input.trim();
         if value.is_empty() {
             return Err("Enter a URL or search term");
         }
-        if value.len() > 8192 || value.chars().any(char::is_control) {
-            return Err("Invalid address");
-        }
 
-        let direct = value.starts_with("https://") || value.starts_with("http://");
+        let direct = value.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+            || value.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
         let authority = value.split(['/', '?', '#']).next().unwrap_or_default();
         let host_port = authority.rsplit_once(':').is_some_and(|(host, port)| {
             !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
@@ -63,6 +72,9 @@ impl BrowserState {
         let looks_like_host = !value.contains(char::is_whitespace)
             && (authority.contains('.') || authority == "localhost" || host_port);
 
+        if value.starts_with("//") || value.contains('\\') {
+            return Err("Invalid address");
+        }
         let candidate = if direct {
             value.to_owned()
         } else if value.contains("://") || (authority.contains(':') && !host_port) {
@@ -70,9 +82,7 @@ impl BrowserState {
         } else if looks_like_host {
             format!("https://{value}")
         } else {
-            let mut search = Url::parse("https://duckduckgo.com/").map_err(|_| "Invalid search URL")?;
-            search.query_pairs_mut().append_pair("q", value);
-            return Ok(search);
+            return provider.search(value);
         };
 
         let url = Url::parse(&candidate).map_err(|_| "Invalid address")?;
@@ -205,5 +215,21 @@ mod tests {
         for input in ["example.com", "example.com:8443", "localhost:8443"] {
             assert_eq!(BrowserState::parse_address(input).unwrap().scheme(), "https");
         }
+    }
+    #[test]
+    fn rejects_ambiguous_addresses() {
+        for input in ["\nhttps://example.com", "https://example.com\t", "//example.com", "https://example.com\\path"] {
+            assert!(BrowserState::parse_address(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn accepts_uppercase_https_scheme() {
+        assert_eq!(BrowserState::parse_address("HTTPS://example.com").unwrap().host_str(), Some("example.com"));
+    }
+
+    #[test]
+    fn rejects_overlong_raw_input() {
+        assert!(BrowserState::parse_address(&format!("{}example.com", " ".repeat(8192))).is_err());
     }
 }
