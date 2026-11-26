@@ -2,6 +2,7 @@ use url::Url;
 
 pub mod native_tabs;
 pub mod browser_features;
+pub mod preferences;
 pub mod session;
 
 #[derive(Clone, Debug)]
@@ -48,6 +49,10 @@ impl BrowserState {
     }
 
     pub fn parse_address(input: &str) -> Result<Url, &'static str> {
+        Self::parse_address_with(input, preferences::SearchProvider::DuckDuckGo)
+    }
+
+    pub fn parse_address_with(input: &str, provider: preferences::SearchProvider) -> Result<Url, &'static str> {
         if input.len() > 8192 || input.chars().any(char::is_control) {
             return Err("Invalid address");
         }
@@ -76,9 +81,7 @@ impl BrowserState {
         } else if looks_like_host {
             format!("https://{value}")
         } else {
-            let mut search = Url::parse("https://duckduckgo.com/").map_err(|_| "Invalid search URL")?;
-            search.query_pairs_mut().append_pair("q", value);
-            return Ok(search);
+            return provider.search(value);
         };
 
         let url = Url::parse(&candidate).map_err(|_| "Invalid address")?;

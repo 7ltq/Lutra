@@ -3,11 +3,12 @@ pub const MAX_TABS: usize = 32;
 pub struct NativeTabs<T> {
     slots: Vec<Option<T>>,
     active: usize,
+    pinned: Vec<bool>,
 }
 
 impl<T> Default for NativeTabs<T> {
     fn default() -> Self {
-        Self { slots: vec![None], active: 0 }
+        Self { slots: vec![None], active: 0, pinned: vec![false] }
     }
 }
 
@@ -38,6 +39,7 @@ impl<T> NativeTabs<T> {
             return false;
         }
         self.slots.push(None);
+        self.pinned.push(false);
         self.active = self.slots.len() - 1;
         true
     }
@@ -50,13 +52,38 @@ impl<T> NativeTabs<T> {
         true
     }
 
+    pub fn is_pinned(&self, index: usize) -> bool {
+        self.pinned.get(index).copied().unwrap_or(false)
+    }
+
+    pub fn toggle_pin(&mut self, index: usize) -> bool {
+        let Some(pin) = self.pinned.get_mut(index) else { return false };
+        *pin = !*pin;
+        true
+    }
+
+    pub fn move_tab(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.slots.len() || to >= self.slots.len() || from == to { return false; }
+        let slot = self.slots.remove(from);
+        let pin = self.pinned.remove(from);
+        self.slots.insert(to, slot);
+        self.pinned.insert(to, pin);
+        self.active = if self.active == from { to }
+            else if from < self.active && self.active <= to { self.active - 1 }
+            else if to <= self.active && self.active < from { self.active + 1 }
+            else { self.active };
+        true
+    }
+
     pub fn close(&mut self, index: usize) -> bool {
         if index >= self.slots.len() {
             return false;
         }
         self.slots.remove(index);
+        self.pinned.remove(index);
         if self.slots.is_empty() {
             self.slots.push(None);
+            self.pinned.push(false);
             self.active = 0;
         } else if index < self.active {
             self.active -= 1;
@@ -72,6 +99,22 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[test]
+    fn moving_preserves_selection_and_pin() {
+        let mut tabs = NativeTabs::default();
+        tabs.insert_active(1).unwrap();
+        tabs.toggle_pin(0);
+        tabs.open();
+        tabs.insert_active(2).unwrap();
+        assert!(tabs.move_tab(0, 1));
+        assert_eq!(tabs.active(), Some(&2));
+        assert!(tabs.is_pinned(1));
+        assert!(!tabs.is_pinned(0));
+        tabs.close(1);
+        assert_eq!(tabs.slots().len(), 1);
+        assert!(!tabs.is_pinned(0));
+    }
 
     #[test]
     fn new_tabs_are_lazy() {
