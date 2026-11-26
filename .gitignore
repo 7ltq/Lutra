@@ -1,0 +1,3 @@
+/target/
+/crates/servo-integration/target/
+*.pdb

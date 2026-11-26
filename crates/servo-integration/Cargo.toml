@@ -1,0 +1,26 @@
+[package]
+name = "servo-integration"
+version = "0.7.1"
+edition = "2021"
+license = "MIT"
+
+[features]
+default = []
+servo-experimental = ["dep:servo", "dep:embedder_traits", "dep:webrender_api", "dep:euclid", "dep:winit", "dep:rustls", "dep:tracing"]
+
+[dependencies]
+url = "2.5"
+servo = { git = "https://github.com/servo/servo", package = "servo", tag = "v0.7.0", optional = true }
+embedder_traits = { git = "https://github.com/servo/servo", package = "embedder_traits", tag = "v0.7.0", optional = true }
+webrender_api = { git = "https://github.com/servo/servo", package = "webrender_api", tag = "v0.7.0", optional = true }
+euclid = { version = "0.22", optional = true }
+winit = { version = "0.30", optional = true }
+rustls = { version = "0.23", optional = true, features = ["aws_lc_rs"] }
+tracing = { version = "0.1", optional = true }
+
+[[bin]]
+name = "servo-preview"
+path = "src/bin/servo_preview.rs"
+required-features = ["servo-experimental"]
+
+[workspace]
