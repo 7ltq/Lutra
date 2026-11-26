@@ -2,32 +2,32 @@
 
 A web browser in development. Built with Rust and Servo.
 
-The aim is to give people more control over their browsing, without making the browser a source of unnecessary data collection. It should use no more resources than it needs.
+Browsing should not require giving up privacy. A browser should use no more resources than it needs.
 
 ## Before you use Lutra
 
-Lutra is an experimental project, not a browser ready for daily use. Do not rely on it for sensitive browsing.
+Lutra is an experimental project. Do not rely on it for sensitive browsing.
 
-The original tab interface and the web engine run separately. The experimental renderer now includes its own address bar and navigation controls in the same window as the web page. It has no native tab strip yet. Site isolation, sandboxing, tracking protection, storage partitioning and resistance to browser fingerprinting have not been implemented. The privacy settings in the source code do not yet enforce these protections.
+The native browser now has a tab strip and a local new-tab page. Opening an empty tab does not create a web view or request a default website. The engine itself is initialized at startup. Only the selected web view is painted.
 
-Lutra does not include its own telemetry service. This does not prevent websites, network providers or engine dependencies from communicating over the network. Lutra does not hide your IP address.
+The experimental navigation policy rejects non-HTTPS addresses and denies permission requests. This is not a guarantee that all network traffic uses HTTPS. It does not provide anonymity.
 
-We have not established how much memory the browser uses. We intend to publish measurements rather than estimates.
+The tabs currently share a Servo engine and rendering context. They are not isolated security boundaries. Site isolation, operating-system sandboxing, storage partitioning, tracking protection and fingerprinting resistance remain unimplemented. Do not use this build as a substitute for a privacy browser.
+
+Lutra has no first-party telemetry service. Websites and other components can still communicate over the network.
+
+We have not established the memory or CPU use of the complete browser. We intend to publish measurements, not estimates.
 
 ## Build on Windows
 
-Install Rust and the Visual Studio C++ build tools. For the engine, also follow the [Servo Windows build instructions](https://book.servo.org/building/windows.html) and [embedding instructions](https://book.servo.org/embedding/overview.html).
+Install Rust, the Visual Studio C++ build tools and the prerequisites in the [Servo build documentation](https://book.servo.org/).
 
-- `build.bat`: build the interface.
-- `test.bat`: run the workspace tests.
-- `build-all.bat`: build the experimental Servo renderer and start the interface.
+Run `build-all.bat` to build and launch the native experimental browser. The legacy interface can still be built with `build.bat`. Use `test.bat` for the workspace tests.
 
-The experimental renderer targets Servo v0.7.0. The Windows workflow tests the original interface. A separate workflow builds the renderer when relevant source files change. A successful build does not establish that the program renders correctly.
-
-See [the build results](https://github.com/7ltq/Lutra/actions) for the state of each revision.
+The experimental engine targets Servo v0.7.0. See [build results](https://github.com/7ltq/Lutra/actions) for each revision. Compilation is not a runtime or security test.
 
 ## Development
 
-The next step is to verify the combined rendering and navigation window on Windows. The renderer denies permission requests and restricts navigation requests to HTTP and HTTPS URLs without credentials. These checks are not a sandbox or comprehensive network protection. Native tabs and site isolation remain open.
+See [security boundaries](docs/security.md) and [resource measurement](docs/performance.md) for what the current implementation does and does not provide.
 
 Lutra is an independent project. It is not affiliated with Mullvad, the Tor Project or Servo.

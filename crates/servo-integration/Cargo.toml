@@ -1,15 +1,16 @@
 [package]
 name = "servo-integration"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 license = "MIT"
 
 [features]
 default = []
-servo-experimental = ["dep:servo", "dep:euclid", "dep:winit", "dep:rustls", "dep:egui", "dep:egui_glow", "dep:browser-core"]
+servo-experimental = ["dep:servo", "dep:euclid", "dep:winit", "dep:rustls", "dep:egui", "dep:egui_glow", "dep:image"]
 
 [dependencies]
-browser-core = { path = "../browser-core", optional = true }
+browser-core = { path = "../browser-core" }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 egui = { version = "=0.34.3", optional = true }
 egui_glow = { version = "=0.34.3", features = ["winit"], optional = true }
 url = "2.5"

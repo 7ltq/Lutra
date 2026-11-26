@@ -1,5 +1,7 @@
 use url::Url;
 
+pub mod native_tabs;
+
 #[derive(Clone, Debug)]
 pub struct Tab {
     pub id: u64,
@@ -45,25 +47,46 @@ impl BrowserState {
 
     pub fn parse_address(input: &str) -> Result<Url, &'static str> {
         let value = input.trim();
-        if value.is_empty() { return Err("Enter a URL or search term"); }
-        let candidate = if value.contains("://") {
-            value.to_string()
-        } else if value == "localhost" || value.starts_with("localhost:") || (value.contains('.') && !value.contains(char::is_whitespace)) {
+        if value.is_empty() {
+            return Err("Enter a URL or search term");
+        }
+        if value.len() > 8192 || value.chars().any(char::is_control) {
+            return Err("Invalid address");
+        }
+
+        let direct = value.starts_with("https://") || value.starts_with("http://");
+        let authority = value.split(['/', '?', '#']).next().unwrap_or_default();
+        let host_port = authority.rsplit_once(':').is_some_and(|(host, port)| {
+            !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+                && (host == "localhost" || host.contains('.'))
+        });
+        let looks_like_host = !value.contains(char::is_whitespace)
+            && (authority.contains('.') || authority == "localhost" || host_port);
+
+        let candidate = if direct {
+            value.to_owned()
+        } else if value.contains("://") || (authority.contains(':') && !host_port) {
+            return Err("Only HTTPS websites are supported");
+        } else if looks_like_host {
             format!("https://{value}")
         } else {
-            let encoded: String = url::form_urlencoded::byte_serialize(value.as_bytes()).collect();
-            format!("https://duckduckgo.com/?q={encoded}")
+            let mut search = Url::parse("https://duckduckgo.com/").map_err(|_| "Invalid search URL")?;
+            search.query_pairs_mut().append_pair("q", value);
+            return Ok(search);
         };
-        let url = Url::parse(&candidate).map_err(|_| "Invalid URL")?;
-        Self::validate(&url)?;
+
+        let url = Url::parse(&candidate).map_err(|_| "Invalid address")?;
+        Self::validate_web_url(&url)?;
         Ok(url)
     }
 
-    fn validate(url: &Url) -> Result<(), &'static str> {
-        if !matches!(url.scheme(), "https" | "http") || url.host_str().is_none() {
-            return Err("Only HTTP and HTTPS websites are supported");
+    pub fn validate_web_url(url: &Url) -> Result<(), &'static str> {
+        if url.scheme() != "https" || url.host_str().is_none() {
+            return Err("Only HTTPS websites are supported");
         }
-        if !url.username().is_empty() || url.password().is_some() { return Err("Credentials in URLs are not supported"); }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err("Credentials in URLs are not supported");
+        }
         Ok(())
     }
 
@@ -74,7 +97,7 @@ impl BrowserState {
     }
 
     pub fn commit(&mut self, url: Url) -> Result<(), &'static str> {
-        Self::validate(&url)?;
+        Self::validate_web_url(&url)?;
         let tab = self.tabs.iter_mut().find(|t| Some(t.id) == self.active).ok_or("No active tab")?;
         if tab.url.as_ref() != Some(&url) {
             tab.history.truncate(if tab.history.is_empty() { 0 } else { tab.cursor + 1 });
@@ -162,5 +185,25 @@ mod tests {
         assert_eq!(b.active().unwrap().history.len(), 128);
         for _ in 0..127 { assert!(b.move_history(false)); }
         assert!(!b.move_history(false));
+    }
+    #[test]
+    fn rejects_insecure_and_external_schemes() {
+        for input in ["http://example.com", "javascript:alert(1)", "mailto:test@example.com", "file:///private", "https:example.com"] {
+            assert!(BrowserState::parse_address(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn rejects_credentials_and_control_characters() {
+        for input in ["https://user@example.com", "user:secret@example.com", "https://example.com/\npath"] {
+            assert!(BrowserState::parse_address(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn adds_https_to_bare_hosts() {
+        for input in ["example.com", "example.com:8443", "localhost:8443"] {
+            assert_eq!(BrowserState::parse_address(input).unwrap().scheme(), "https");
+        }
     }
 }
