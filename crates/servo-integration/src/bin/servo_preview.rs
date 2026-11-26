@@ -1,3 +1,4 @@
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -6,6 +7,9 @@ use std::time::{Duration, Instant};
 use browser_core::preferences::{Appearance, BrowserPreferences, SearchProvider};
 use browser_core::{native_tabs::{NativeTabs, MAX_TABS}, session::SessionDirectory, browser_features::{SessionLinks, wheel_lines}, BrowserState};
 use egui_glow::{CallbackFn, EguiGlow};
+#[path = "../page_controls.rs"]
+mod page_controls;
+use page_controls::{ControlOutcome, PageControl};
 use euclid::{Point2D, Rect, Scale, Size2D};
 use servo::{
     Code, DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, Location,
@@ -39,31 +43,70 @@ impl EventLoopWaker for Waker {
     }
 }
 
-struct Delegate(Rc<Window>);
+struct Delegate {
+    window: Rc<Window>,
+    active: Cell<Option<servo::WebViewId>>,
+    control: RefCell<Option<PageControl>>,
+    fullscreen: Cell<Option<bool>>,
+}
+
+impl Delegate {
+    fn active_matches(&self, view: &WebView) -> bool {
+        self.active.get() == Some(view.id())
+    }
+}
 
 impl WebViewDelegate for Delegate {
     fn notify_new_frame_ready(&self, _: WebView) {
-        self.0.request_redraw();
+        self.window.request_redraw();
     }
 
     fn notify_url_changed(&self, _: WebView, _: Url) {
-        self.0.request_redraw();
+        self.window.request_redraw();
     }
 
     fn notify_page_title_changed(&self, _: WebView, _: Option<String>) {
-        self.0.request_redraw();
+        self.window.request_redraw();
     }
 
     fn notify_history_changed(&self, _: WebView, _: Vec<Url>, _: usize) {
-        self.0.request_redraw();
+        self.window.request_redraw();
     }
 
     fn notify_load_status_changed(&self, _: WebView, _: servo::LoadStatus) {
-        self.0.request_redraw();
+        self.window.request_redraw();
     }
 
     fn notify_animating_changed(&self, _: WebView, _: bool) {
-        self.0.request_redraw();
+        self.window.request_redraw();
+    }
+
+    fn notify_status_text_changed(&self, view: WebView, _: Option<String>) {
+        if self.active_matches(&view) { self.window.request_redraw(); }
+    }
+
+    fn notify_fullscreen_state_changed(&self, view: WebView, fullscreen: bool) {
+        if self.active_matches(&view) {
+            self.fullscreen.set(Some(fullscreen));
+            self.window.request_redraw();
+        }
+    }
+
+    fn show_embedder_control(&self, view: WebView, control: servo::EmbedderControl) {
+        if !self.active_matches(&view) || matches!(&control, servo::EmbedderControl::InputMethod(_)) { return; }
+        let mut pending = self.control.borrow_mut();
+        if pending.is_none() {
+            *pending = Some(PageControl::new(view, control));
+            self.window.request_redraw();
+        }
+    }
+
+    fn hide_embedder_control(&self, view: WebView, id: servo::EmbedderControlId) {
+        let mut pending = self.control.borrow_mut();
+        if pending.as_ref().is_some_and(|control| control.matches(view.id(), id)) {
+            *pending = None;
+            self.window.request_redraw();
+        }
     }
 
     fn request_permission(&self, _: WebView, request: PermissionRequest) {
@@ -100,6 +143,7 @@ enum Action {
     Fullscreen,
     AddShortcut,
     RemoveShortcut(usize),
+    OpenLink(Url),
 }
 
 struct Engine {
@@ -203,7 +247,7 @@ impl Engine {
         visuals.selection.bg_fill = egui::Color32::from_rgb(56, 87, 127);
         gui.egui_ctx.set_visuals(visuals);
 
-        let delegate = Rc::new(Delegate(window.clone()));
+        let delegate = Rc::new(Delegate { window: window.clone(), active: Cell::new(None), control: RefCell::new(None), fullscreen: Cell::new(None) });
         let mut engine = Self {
             tabs: NativeTabs::default(),
             servo,
@@ -260,6 +304,9 @@ impl Engine {
     }
 
     fn switch<F: FnOnce(&mut NativeTabs<WebView>) -> bool>(&mut self, change: F) {
+        self.delegate.control.borrow_mut().take();
+        self.delegate.active.set(None);
+        self.delegate.fullscreen.set(None);
         if let Some(view) = self.tabs.active() {
             view.set_focused(false);
             view.hide();
@@ -269,6 +316,7 @@ impl Engine {
             view.show();
             view.set_focused(false);
         }
+        self.delegate.active.set(self.tabs.active().map(WebView::id));
         self.page_focus = false;
         self.cursor = None;
         self.address = self.tabs.active().and_then(WebView::url).map(|url| url.to_string()).unwrap_or_default();
@@ -282,6 +330,12 @@ impl Engine {
 
     fn apply(&mut self, action: Action) {
         match action {
+            Action::OpenLink(url) => {
+                if self.tabs.slots().len() < self.settings.max_tabs && servo_integration::ServoAdapter::accepts(&url) {
+                    self.apply(Action::NewTab);
+                    self.apply(Action::Navigate(url));
+                } else { self.status = "Cannot open link: unsupported address or tab limit.".into(); }
+            }
             Action::Duplicate(index) => {
                 if self.tabs.slots().len() < self.settings.max_tabs {
                     let url = self.tabs.slots().get(index).and_then(Option::as_ref).and_then(WebView::url);
@@ -370,6 +424,7 @@ impl Engine {
                     self.status = "Only HTTPS websites are supported.".into();
                     return;
                 }
+                self.delegate.control.borrow_mut().take();
                 self.address = url.to_string();
                 self.address_dirty = false;
                 self.status.clear();
@@ -412,10 +467,15 @@ impl Engine {
                 }
             }
         }
+        self.delegate.active.set(self.tabs.active().map(WebView::id));
         self.window.request_redraw();
     }
 
     fn draw(&mut self) {
+        if let Some(fullscreen) = self.delegate.fullscreen.take() {
+            self.window.set_fullscreen(if fullscreen { Some(Fullscreen::Borderless(self.window.current_monitor())) } else { None });
+        }
+        if self.delegate.control.borrow().is_some() { self.focus_page(false); }
         let size = self.window.inner_size();
         if size.width == 0 || size.height == 0 || self.context.make_current().is_err() {
             return;
@@ -437,7 +497,7 @@ impl Engine {
         }
         let mut action = None;
         let Self { tabs, gui, context, parent, window, address, address_dirty, focus_address,
-            status, viewport, viewport_scale, links, home_search, scroll_speed, show_history, show_bookmarks, show_settings, settings, shortcut_name, shortcut_url, filter, last_title, .. } = self;
+            status, viewport, viewport_scale, links, home_search, scroll_speed, show_history, show_bookmarks, show_settings, settings, shortcut_name, shortcut_url, filter, last_title, delegate, .. } = self;
         let view = tabs.active();
 
         if !*address_dirty {
@@ -451,6 +511,8 @@ impl Engine {
         let caption = view.and_then(WebView::page_title).filter(|title| !title.is_empty()).unwrap_or_else(|| "New tab".into());
         let caption = format!("{} — Lutra", caption.chars().take(160).collect::<String>());
         if *last_title != caption { window.set_title(&caption); *last_title = caption; }
+        let mut control_outcome = ControlOutcome::Pending;
+        let mut pending = delegate.control.borrow_mut().take();
         gui.run(window, |ui| {
             if window.fullscreen().is_none() {
             egui::Panel::top("tabs")
@@ -649,7 +711,15 @@ impl Engine {
                     ui.label(egui::RichText::new("Experimental engine — not for sensitive browsing").small().color(egui::Color32::GRAY));
                 });
             }
+            if let Some(control) = pending.as_mut() {
+                control_outcome = control.draw(ui.ctx());
+            }
         });
+        match control_outcome {
+            ControlOutcome::Pending => { if let Some(control) = pending.take() { *delegate.control.borrow_mut() = Some(control); } }
+            ControlOutcome::Done => { pending.take(); }
+            ControlOutcome::OpenLink(url) => { pending.take(); action = Some(Action::OpenLink(url)); }
+        }
 
         if context.make_current().is_ok() {
             parent.prepare_for_rendering();
@@ -669,7 +739,8 @@ impl Engine {
     }
 
     fn handle(&mut self, event: WindowEvent) {
-        let page_pointer = self.tabs.active().is_some() && self.cursor.is_some();
+        let control_open = self.delegate.control.borrow().is_some();
+        let page_pointer = !control_open && self.tabs.active().is_some() && self.cursor.is_some();
         let response = self.gui.on_window_event(&self.window, &event);
         if response.repaint && !matches!(&event, WindowEvent::RedrawRequested) {
             self.window.request_redraw();
@@ -691,6 +762,7 @@ impl Engine {
                 self.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
+                if control_open { self.cursor = None; return; }
                 let logical = egui::pos2(position.x as f32 / self.viewport_scale, position.y as f32 / self.viewport_scale);
                 if self.viewport.contains(logical) {
                     let relative = logical - self.viewport.min;
@@ -761,6 +833,7 @@ impl Engine {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if control_open { self.window.request_redraw(); return; }
                 if event.state == ElementState::Pressed && !event.repeat {
                     let shortcut = match &event.logical_key {
                         WinitKey::Named(WinitNamedKey::F5) => Some(Action::Reload),
